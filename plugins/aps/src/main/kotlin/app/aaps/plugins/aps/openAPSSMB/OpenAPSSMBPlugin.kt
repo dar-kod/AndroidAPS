@@ -74,6 +74,8 @@ import app.aaps.plugins.aps.R
 import app.aaps.plugins.aps.events.EventOpenAPSUpdateGui
 import app.aaps.plugins.aps.events.EventResetOpenAPSGui
 import app.aaps.plugins.aps.openAPS.TddStatus
+import app.aaps.plugins.insulin.sipp.SentinelPkPdController
+import app.aaps.plugins.insulin.sipp.SippPrefs
 import org.json.JSONObject
 import javax.inject.Inject
 import javax.inject.Provider
@@ -104,7 +106,8 @@ open class OpenAPSSMBPlugin @Inject constructor(
     private val determineBasalSMB: DetermineBasalSMB,
     private val profiler: Profiler,
     private val glucoseStatusCalculatorSMB: GlucoseStatusCalculatorSMB,
-    private val apsResultProvider: Provider<APSResult>
+    private val apsResultProvider: Provider<APSResult>,
+    private val sentinelController: SentinelPkPdController
 ) : PluginBase(
     PluginDescription()
         .mainType(PluginType.APS)
@@ -419,6 +422,32 @@ open class OpenAPSSMBPlugin @Inject constructor(
         val iobArray = iobCobCalculator.calculateIobArrayForSMB(autosensResult, SMBDefaults.exercise_mode, SMBDefaults.half_basal_exercise_target, isTempTarget)
         val mealData = iobCobCalculator.getMealDataWithWaitingForCalculationFinish()
 
+        // --- SIPP ISF (mutually exclusive with DS) -----------------------------------
+        val dsOn = preferences.get(BooleanKey.ApsUseDynamicSensitivity)
+        val isfSippOnInitial = SippPrefs.enableIsf()
+
+        // If DS is ON and SIPP-ISF is also ON, disable SIPP-ISF (DS wins)
+        if (dsOn && isfSippOnInitial) {
+            SippPrefs.setEnableIsf(false)
+        }
+        val isfSippOn = SippPrefs.enableIsf()
+
+        // Base ISF from profile (mg/dL per U) – OpenAPS code expects non-null here
+        val baseIsfMgdl: Double = profile.getIsfMgdl("OpenAPSSMBPlugin")
+
+        // SIPP scale (0.60..1.40 by SIPP rails)
+        val isfScale: Double = sentinelController.current().isfScale.toDouble()
+
+        // Final ISF to send to JS: apply SIPP only when DS is OFF and SIPP-ISF is ON
+        val sensForJs: Double = baseIsfMgdl * (if (isfSippOn && !dsOn) isfScale else 1.0)
+
+        // Optional: quick log in mmol/L per U for human readability (e.g., 3.6)
+        runCatching {
+            val isfMmol = sensForJs / 18.0
+            aapsLogger.debug("SIPP ISF visible: %.2f mmol/L/U (scale=%.0f%%, DS=%s)".format(isfMmol, isfScale * 100.0, dsOn))
+        }
+        // ---------------------------------------------------------------------------
+
         @Suppress("KotlinConstantConditions")
         val oapsProfile = OapsProfile(
             dia = 0.0, // not used
@@ -430,7 +459,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
             max_bg = maxBg,
             target_bg = targetBg,
             carb_ratio = profile.getIc(),
-            sens = profile.getIsfMgdl("OpenAPSSMBPlugin"),
+            sens = sensForJs,
             autosens_adjust_targets = false, // not used
             max_daily_safety_multiplier = preferences.get(DoubleKey.ApsMaxDailyMultiplier),
             current_basal_safety_multiplier = preferences.get(DoubleKey.ApsMaxCurrentBasalMultiplier),
@@ -467,6 +496,62 @@ open class OpenAPSSMBPlugin @Inject constructor(
         )
         val microBolusAllowed = constraintsChecker.isSMBModeEnabled(ConstraintObject(tempBasalFallback.not(), aapsLogger)).also { inputConstraints.copyReasons(it) }.value()
         val flatBGsDetected = bgQualityCheck.state == BgQualityCheck.State.FLAT
+        // --- SIPP evidence update (O(1), battery-neutral) ---
+        runCatching {
+            // glucoseStatus here is non-null (validated above)
+            val gs = glucoseStatus
+
+            val nowMs = dateUtil.now()
+
+            // 1) Current BG (mg/dL) and a short-horizon projection
+            val bgNow = gs.glucose
+            val deltaPerMin = try {
+                gs.delta
+            } catch (_: Throwable) {
+                0.0
+            }
+            val bgPred = bgNow + 15.0 * deltaPerMin
+
+            // 2) IOB / suspend not available here → safe fallbacks
+            val iobU = 0.0
+            val basalSuspendedMin = 0
+
+            // 3) Optional site context from SIPP prefs
+            val siteAgeHours = if (SippPrefs.siteAgeEnabled())
+                SippPrefs.siteAgeH().toDoubleOrNull() ?: 1.0
+            else 1.0
+            val minutesSinceLastBolus = 9999 // not available here
+
+            // 4) HR/exercise unknown here → null/false
+            val hrBpm: Int? = null
+            val inExercise: Boolean? = null
+
+            // 5) Sensor health: upstream checks already passed → OK
+            val sensorOk = true
+
+            // 6) Baseline rails (profile DIA and configured peak)
+            val baseDiaH = profile.dia.toFloat()
+            val basePeakMin = preferences.get(IntKey.InsulinOrefPeak)
+
+            // 7) Update SIPP
+            sentinelController.applyEvidence(
+                nowMs = nowMs,
+                bgNow = bgNow,
+                bgPred = bgPred,
+                deltaPerMin = deltaPerMin,
+                iobU = iobU,
+                basalSuspendedMin = basalSuspendedMin,
+                siteAgeHours = siteAgeHours,
+                minutesSinceLastBolus = minutesSinceLastBolus,
+                hr = hrBpm,
+                inExercise = inExercise,
+                sensorOk = sensorOk,
+                baseDiaH = baseDiaH,
+                basePeakMin = basePeakMin
+            )
+        }.onFailure {
+            // Never let SIPP affect dosing if something goes wrong
+        }
 
         aapsLogger.debug(LTag.APS, ">>> Invoking determine_basal SMB <<<")
         aapsLogger.debug(LTag.APS, "Glucose status:     $glucoseStatus")
