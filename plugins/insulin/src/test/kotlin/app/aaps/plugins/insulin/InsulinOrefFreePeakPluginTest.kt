@@ -3,6 +3,7 @@ package app.aaps.plugins.insulin
 import app.aaps.core.interfaces.insulin.Insulin
 import app.aaps.core.interfaces.ui.UiInteraction
 import app.aaps.core.keys.IntKey
+import app.aaps.plugins.insulin.sipp.SentinelPkPdController
 import app.aaps.shared.tests.TestBaseWithProfile
 import com.google.common.truth.Truth.assertThat
 import org.junit.jupiter.api.BeforeEach
@@ -10,6 +11,8 @@ import org.junit.jupiter.api.Test
 import org.mockito.ArgumentMatchers.eq
 import org.mockito.Mock
 import org.mockito.Mockito.`when`
+import org.mockito.kotlin.mock
+import org.mockito.kotlin.whenever
 
 /**
  * Created by adrian on 2019-12-25.
@@ -21,9 +24,31 @@ class InsulinOrefFreePeakPluginTest : TestBaseWithProfile() {
 
     @Mock lateinit var uiInteraction: UiInteraction
 
+    // SIPP mock to satisfy plugin constructor
+    private lateinit var sipp: SentinelPkPdController
+
     @BeforeEach
     fun setup() {
-        sut = InsulinOrefFreePeakPlugin(preferences, rh, profileFunction, rxBus, aapsLogger, config, hardLimits, uiInteraction)
+        sipp = mock()
+        whenever(sipp.current()).thenReturn(
+            SentinelPkPdController.Estimates(
+                diaH = 10f,
+                peakH = null,     // let plugin fall back to profile peak when needed
+                isfScale = 1.0f   // neutral
+            )
+        )
+
+        sut = InsulinOrefFreePeakPlugin(
+            preferences,
+            rh,
+            profileFunction,
+            rxBus,
+            aapsLogger,
+            config,
+            hardLimits,
+            uiInteraction,
+            sipp = sipp
+        )
     }
 
     @Test
