@@ -53,8 +53,21 @@ class SentinelPkPdController @Inject constructor() {
     @Volatile private var isfMult: Float = 1.00f
     @Volatile private var cusum: Float = 0.0f
     @Volatile private var lastTickMs: Long = 0L
+    @Volatile private var restored = false
+
+    private fun tryRestoreOnce() {
+        if (restored) return
+        restored = true
+        // If there is a saved live state, restore it so installs/updates don't reset DIA/Peak/ISF.
+        SippPrefs.loadState()?.let { s ->
+            diaH = s.diaH.coerceIn(DIA_MIN, DIA_MAX)
+            tPeakMin = s.tPeakMin.coerceIn(TPEAK_MIN_MIN, TPEAK_MAX_MIN)
+            isfMult = s.isfMult.coerceIn(ISF_MIN, ISF_MAX)
+        }
+    }
 
     fun current(): Estimates = synchronized(this) {
+        tryRestoreOnce()
         Estimates(diaH = diaH, peakH = tPeakMin / 60f, isfScale = isfMult)
     }
 
@@ -78,12 +91,15 @@ class SentinelPkPdController @Inject constructor() {
         baseDiaH: Float,
         basePeakMin: Int
     ) = synchronized(this) {
+        tryRestoreOnce()
+
         val dtMin = if (lastTickMs == 0L) 5.0f else max(1L, nowMs - lastTickMs) / 60000.0f
         lastTickMs = nowMs
 
         // If PK disabled → soft decay and exit
         if (!SippPrefs.enablePk()) {
             decay(dtMin, baseDiaH, basePeakMin)
+            SippPrefs.saveState(diaH, tPeakMin, isfMult, nowMs)
             return
         }
 
@@ -91,6 +107,7 @@ class SentinelPkPdController @Inject constructor() {
         if (!sensorOk) {
             decay(dtMin, baseDiaH, basePeakMin)
             clampAll()
+            SippPrefs.saveState(diaH, tPeakMin, isfMult, nowMs)
             return
         }
 
@@ -102,7 +119,7 @@ class SentinelPkPdController @Inject constructor() {
         // 2) Sentinels
         val earlySite = siteAgeHours < 24.0
         val recentStack = minutesSinceLastBolus in 1..120
-        val falling = deltaPerMin < -0.05   // adjust if mmol/L (~ -0.003 mmol/L/min)
+        val falling = deltaPerMin < -0.05   // adjust if mmol/L
         val prolongedSuspend = basalSuspendedMin >= 20
         val negIob = iobU < 0.0
 
@@ -156,6 +173,9 @@ class SentinelPkPdController @Inject constructor() {
         diaH = diaH.coerceIn(DIA_MIN, min(DIA_MAX, diaCeil))
         tPeakMin = tPeakMin.coerceIn(TPEAK_MIN_MIN, TPEAK_MAX_MIN)
         isfMult = isfMult.coerceIn(ISF_MIN, ISF_MAX)
+
+        // 6) Persist the live state so updates don't reset behavior
+        SippPrefs.saveState(diaH, tPeakMin, isfMult, nowMs)
     }
 
     private fun decay(dtMin: Float, baseDiaH: Float, basePeakMin: Int) {

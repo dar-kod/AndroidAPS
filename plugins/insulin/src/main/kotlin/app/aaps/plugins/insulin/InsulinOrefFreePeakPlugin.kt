@@ -12,6 +12,7 @@ import app.aaps.core.interfaces.configuration.Config
 import app.aaps.core.interfaces.insulin.Insulin
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.plugin.PluginDescription
+import app.aaps.core.interfaces.profile.Profile
 import app.aaps.core.interfaces.profile.ProfileFunction
 import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.bus.RxBus
@@ -46,7 +47,13 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
     uiInteraction: UiInteraction,
     private val sipp: SentinelPkPdController
 ) : InsulinOrefBasePlugin(
-    rHelp, profFunc, rxBus, aapsLogger, config, hardLimits, uiInteraction
+    rHelp,
+    wrapProfileFunc(profFunc, hardLimits), // clamp profile DIA globally for this plugin
+    rxBus,
+    aapsLogger,
+    config,
+    hardLimits,
+    uiInteraction
 ) {
 
     override val id get(): Insulin.InsulinType = Insulin.InsulinType.OREF_FREE_PEAK
@@ -62,68 +69,63 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
     override fun commentStandardText(): String =
         rh.gs(R.string.insulin_peak_time) + ": " + peak
 
-    // Feed DIA from SIPP (bounded) or profile if SIPP PK is off
+    // DIA for dosing (no HardLimits.kt edits needed)
     override val userDefinedDia: Double
         get() {
-            val profileDia = profileFunction.getProfile()?.dia ?: hardLimits.minDia()
-            if (!SippPrefs.enablePk()) return profileDia
+            val profileDiaRaw = profileFunction.getProfile()?.dia ?: hardLimits.minDia()
+            val diaUiMax = if (SippPrefs.allowDiaAbove9h()) 20.0 else 12.0
+            val profDiaH = profileDiaRaw.coerceIn(hardLimits.minDia(), diaUiMax)
+            if (!SippPrefs.enablePk()) return profDiaH
             val est = sipp.current()
-            val upper = if (SippPrefs.allowDiaAbove9h()) 16.0 else 9.0
-            return est.diaH.toDouble().coerceIn(5.0, upper)
+            return est.diaH.toDouble().coerceIn(hardLimits.minDia(), diaUiMax)
         }
 
-    // Feed Peak (minutes) from SIPP or profile if SIPP PK is off
+    // Peak (minutes) from SIPP or profile if SIPP PK is off
     override val peak: Int
         get() = if (SippPrefs.enablePk()) {
             val prefMin = preferences.get(IntKey.InsulinOrefPeak)
             val peakH = (sipp.current().peakH ?: (prefMin / 60f)).coerceIn(0.6f, 4.0f)
             (peakH * 60f).roundToInt()
-        } else {
-            preferences.get(IntKey.InsulinOrefPeak)
-        }
+        } else preferences.get(IntKey.InsulinOrefPeak)
 
-    // --------- helper: live SIPP readouts ----------
+    // Readouts
     private fun updateSippReadouts(
         sippDiaRow: Preference,
         sippPeakRow: Preference,
         sippIsfRow: Preference
     ) {
-        val profDiaH = profileFunction.getProfile()?.dia ?: hardLimits.minDia()
+        val profileDiaRaw = profileFunction.getProfile()?.dia ?: hardLimits.minDia()
+        val diaUiMax = if (SippPrefs.allowDiaAbove9h()) 20.0 else 12.0
+        val profDiaH = profileDiaRaw.coerceIn(hardLimits.minDia(), diaUiMax)
         val profPeakMin = preferences.get(IntKey.InsulinOrefPeak)
 
         val sippPkOn = SippPrefs.enablePk()
         val sippIsfOn = SippPrefs.enableIsf()
         val dsOn = preferences.get(BooleanKey.ApsUseDynamicSensitivity)
 
-        // DIA readout
         if (sippPkOn) {
             val e = sipp.current()
-            val diaUpper = if (SippPrefs.allowDiaAbove9h()) 16f else 9f
-            val curDiaH = e.diaH.coerceIn(5f, diaUpper)
+            val diaUpper = if (SippPrefs.allowDiaAbove9h()) 20f else 12f
+            val curDiaH = e.diaH.coerceIn(hardLimits.minDia().toFloat(), diaUpper)
             sippDiaRow.summary = String.format(
                 Locale.getDefault(),
-                "Current (SIPP): %.2f h   |   Profile: %.2f h",
-                curDiaH, profDiaH
+                "Current (SIPP): %.2f h   |   Profile: %.2f h", curDiaH, profDiaH
             )
         } else {
             sippDiaRow.summary = String.format(
                 Locale.getDefault(),
-                "Current (SIPP): —   |   Profile: %.2f h",
-                profDiaH
+                "Current (SIPP): —   |   Profile: %.2f h", profDiaH
             )
         }
 
-        // Peak readout
         if (sippPkOn) {
             val e = sipp.current()
             val curPeakH = (e.peakH ?: (profPeakMin / 60f)).coerceIn(0.6f, 4.0f)
-            sippPeakRow.summary =
-                "Current (SIPP): ${(curPeakH * 60f).roundToInt()} min   |   Profile: $profPeakMin min"
+            sippPeakRow.summary = "Current (SIPP): ${(curPeakH * 60f).roundToInt()} min   |   Profile: $profPeakMin min"
         } else {
             sippPeakRow.summary = "Current (SIPP): —   |   Profile: $profPeakMin min"
         }
 
-        // ISF readout
         if (sippIsfOn && !dsOn) {
             val scalePct = (sipp.current().isfScale * 100f).roundToInt()
             sippIsfRow.summary = "Current (SIPP): $scalePct% of base"
@@ -147,11 +149,9 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         requiredKey: String?
     ) {
         if (requiredKey != null) return
-
-        // Initialize plugin-local prefs store
         SippPrefs.init(context)
 
-        // ===== Free-Peak section =====
+        // Free-Peak section
         val fpCat = PreferenceCategory(context).apply {
             key = "insulin_free_peak_settings"
             title = rh.gs(R.string.insulin_oref_peak)
@@ -159,16 +159,12 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         }
         parent.addPreference(fpCat)
         fpCat.addPreference(
-            AdaptiveIntPreference(
-                ctx = context,
-                intKey = IntKey.InsulinOrefPeak,
-                title = R.string.insulin_peak_time
-            )
+            AdaptiveIntPreference(ctx = context, intKey = IntKey.InsulinOrefPeak, title = R.string.insulin_peak_time)
         )
 
-        // ===== SIPP section =====
+        // SIPP section
         val sippCategory = PreferenceCategory(context).also {
-            it.key = "insulin_sipp_settings"
+            it.key = "insulin_SIPP_settings"
             it.title = "SIPP (Auto PK/PD)"
             it.initialExpandedChildrenCount = 0
         }
@@ -176,7 +172,7 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
 
         // Master PK (Peak & DIA)
         val sippPk = SwitchPreferenceCompat(context).apply {
-            key = "sipp_enable_pk"
+            key = "SIPP_enable_pk"
             title = "Enable SIPP: PK (DIA & Peak)"
             summary = "Let SIPP auto-tune DIA/Peak with safety rails."
             isChecked = SippPrefs.enablePk()
@@ -185,28 +181,27 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
 
         // ISF (mutually exclusive with Dynamic Sensitivity)
         val sippIsf = SwitchPreferenceCompat(context).apply {
-            key = "sipp_enable_isf"
+            key = "SIPP_enable_isf"
             title = "Enable SIPP: ISF"
             summary = "Guarded ISF scaling (disabled when Dynamic Sensitivity is on)."
             isChecked = SippPrefs.enableIsf()
-            isEnabled = SippPrefs.enablePk() &&
-                !preferences.get(BooleanKey.ApsUseDynamicSensitivity)
+            isEnabled = SippPrefs.enablePk() && !preferences.get(BooleanKey.ApsUseDynamicSensitivity)
         }
         sippCategory.addPreference(sippIsf)
 
         // Expert: allow DIA > 9 h
         val sippDiaExpert = SwitchPreferenceCompat(context).apply {
-            key = "sipp_allow_dia_above_9h"
+            key = "SIPP_allow_dia_above_9h"
             title = "Allow DIA > 9 h (expert)"
-            summary = "Lets SIPP extend DIA to handle slow sites/stacking."
+            summary = "Lets SIPP extend DIA to handle slow sites/stacking (up to 20 h)."
             isChecked = SippPrefs.allowDiaAbove9h()
             isEnabled = SippPrefs.enablePk()
         }
         sippCategory.addPreference(sippDiaExpert)
 
-        // Optional site inputs (read by SIPP if you choose)
+        // Optional site inputs
         val siteLocationPref = ListPreference(context).apply {
-            key = "sipp_site_location"
+            key = "SIPP_site_location"
             title = "Site Location"
             entries = arrayOf("Abdomen", "Arm", "Thigh")
             entryValues = arrayOf("ABDOMEN", "ARM", "THIGH")
@@ -217,7 +212,7 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         sippCategory.addPreference(siteLocationPref)
 
         val siteAgeEnabledPref = SwitchPreferenceCompat(context).apply {
-            key = "sipp_site_age_enabled"
+            key = "SIPP_site_age_enabled"
             title = "Use Site Age Effect (advanced)"
             summary = "OFF recommended for Medtrum Nano. Enable only if you know age affects absorption."
             isChecked = SippPrefs.siteAgeEnabled()
@@ -225,7 +220,7 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         sippCategory.addPreference(siteAgeEnabledPref)
 
         val siteAgePref = EditTextPreference(context).apply {
-            key = "sipp_site_age_h"
+            key = "SIPP_site_age_h"
             title = "Site Age (hours)"
             dialogTitle = "Enter hours since insertion"
             val currentAge = SippPrefs.siteAgeH()
@@ -238,21 +233,21 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
 
         // Readouts (non-clickable)
         val sippDiaRow = Preference(context).apply {
-            key = "sipp_readout_dia"
+            key = "SIPP_readout_dia"
             title = "DIA"
             isSelectable = false
         }
         sippCategory.addPreference(sippDiaRow)
 
         val sippPeakRow = Preference(context).apply {
-            key = "sipp_readout_peak"
+            key = "SIPP_readout_peak"
             title = "Peak Time"
             isSelectable = false
         }
         sippCategory.addPreference(sippPeakRow)
 
         val sippIsfRow = Preference(context).apply {
-            key = "sipp_readout_isf"
+            key = "SIPP_readout_isf"
             title = "ISF"
             isSelectable = false
         }
@@ -269,7 +264,6 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         sippIsf.setOnPreferenceChangeListener { _, newValue ->
             val on = newValue as Boolean
             if (on && preferences.get(BooleanKey.ApsUseDynamicSensitivity)) {
-                // Turn off Dynamic Sensitivity if user enables SIPP ISF
                 preferences.put(BooleanKey.ApsUseDynamicSensitivity, false)
             }
             SippPrefs.setEnableIsf(on)
@@ -305,5 +299,20 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
 
         // Initial fill
         updateSippReadouts(sippDiaRow, sippPeakRow, sippIsfRow)
+    }
+}
+
+/** Clamp profile.dia for all consumers inside this plugin. */
+private fun wrapProfileFunc(
+    base: ProfileFunction,
+    hardLimits: HardLimits
+): ProfileFunction = object : ProfileFunction by base {
+    override fun getProfile(): Profile? {
+        val p = base.getProfile() ?: return null
+        val diaUiMax = if (SippPrefs.allowDiaAbove9h()) 20.0 else 12.0
+        return object : Profile by p {
+            override val dia: Double
+                get() = p.dia.coerceIn(hardLimits.minDia(), diaUiMax)
+        }
     }
 }
