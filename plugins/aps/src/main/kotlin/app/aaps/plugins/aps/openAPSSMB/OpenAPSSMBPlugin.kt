@@ -20,7 +20,6 @@ import app.aaps.core.interfaces.aps.APSResult
 import app.aaps.core.interfaces.aps.AutosensResult
 import app.aaps.core.interfaces.aps.CurrentTemp
 import app.aaps.core.interfaces.aps.GlucoseStatus
-import app.aaps.core.interfaces.aps.GlucoseStatusSMB
 import app.aaps.core.interfaces.aps.OapsProfile
 import app.aaps.core.interfaces.bgQualityCheck.BgQualityCheck
 import app.aaps.core.interfaces.configuration.Config
@@ -73,7 +72,6 @@ import app.aaps.plugins.aps.OpenAPSFragment
 import app.aaps.plugins.aps.R
 import app.aaps.plugins.aps.events.EventOpenAPSUpdateGui
 import app.aaps.plugins.aps.events.EventResetOpenAPSGui
-import app.aaps.plugins.aps.openAPS.TddStatus
 import app.aaps.plugins.insulin.sipp.SentinelPkPdController
 import app.aaps.plugins.insulin.sipp.SippPrefs
 import org.json.JSONObject
@@ -81,7 +79,7 @@ import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
 import kotlin.math.floor
-import kotlin.math.ln
+import kotlin.math.pow
 
 @Singleton
 open class OpenAPSSMBPlugin @Inject constructor(
@@ -266,41 +264,148 @@ open class OpenAPSSMBPlugin @Inject constructor(
             "DynIsfResult: tdd1D=$tdd1D tdd7D=$tdd7D tddLast24H=$tddLast24H tddLast4H=$tddLast4H tddLast8to4H=$tddLast8to4H tdd=$tdd variableSensitivity=$variableSensitivity insulinDivisor=$insulinDivisor tdd7DDataCarbs=$tdd7DDataCarbs tdd7DAllDaysHaveCarbs=$tdd7DAllDaysHaveCarbs"
     }
 
+    @Suppress("UNUSED_PARAMETER") // multiplier kept for signature compatibility; TDD is not EPS-scaled
     private fun calculateRawDynIsf(multiplier: Double): DynIsfResult {
-        val dynIsfResult = DynIsfResult()
-        // DynamicISF specific
-        // without these values DynISF doesn't work properly
-        // Current implementation is fallback to SMB if TDD history is not available. Thus calculated here
-        val glucoseStatus = glucoseStatusProvider.glucoseStatusData as GlucoseStatusSMB?
-        dynIsfResult.tdd1D = tddCalculator.averageTDD(tddCalculator.calculate(1, allowMissingDays = false))?.data?.totalAmount
+        val dyn = DynIsfResult()
+
+        // --- Maintain DynISF compatibility fields for any other readers ---
+        dyn.tdd1D = tddCalculator
+            .averageTDD(tddCalculator.calculate(1, allowMissingDays = false))
+            ?.data?.totalAmount
+
         tddCalculator.averageTDD(tddCalculator.calculate(7, allowMissingDays = false))?.let {
-            dynIsfResult.tdd7D = it.data.totalAmount
-            dynIsfResult.tdd7DDataCarbs = it.data.carbs
-            dynIsfResult.tdd7DAllDaysHaveCarbs = it.allDaysHaveCarbs
-        }
-        tddCalculator.calculateDaily(-24, 0)?.also {
-            dynIsfResult.tddLast24H = it.totalAmount
-            dynIsfResult.tddLast24HCarbs = it.carbs
-        }
-        dynIsfResult.tddLast4H = tddCalculator.calculateDaily(-4, 0)?.totalAmount
-        dynIsfResult.tddLast8to4H = tddCalculator.calculateDaily(-8, -4)?.totalAmount
-
-        val insulin = activePlugin.activeInsulin
-        dynIsfResult.insulinDivisor = when {
-            insulin.peak > 65 -> 55 // rapid peak: 75
-            insulin.peak > 50 -> 65 // ultra rapid peak: 55
-            else              -> 75 // lyumjev peak: 45
+            dyn.tdd7D = it.data.totalAmount
+            dyn.tdd7DDataCarbs = it.data.carbs
+            dyn.tdd7DAllDaysHaveCarbs = it.allDaysHaveCarbs
         }
 
-
-        if (dynIsfResult.tddPartsCalculated() && glucoseStatus != null) {
-            val tddStatus = TddStatus(dynIsfResult.tdd1D!!, dynIsfResult.tdd7D!!, dynIsfResult.tddLast24H!!, dynIsfResult.tddLast4H!!, dynIsfResult.tddLast8to4H!!)
-            val tddWeightedFromLast8H = ((1.4 * tddStatus.tddLast4H) + (0.6 * tddStatus.tddLast8to4H)) * 3
-            dynIsfResult.tdd = ((tddWeightedFromLast8H * 0.33) + (tddStatus.tdd7D * 0.34) + (tddStatus.tdd1D * 0.33)) * preferences.get(IntKey.ApsDynIsfAdjustmentFactor) / 100.0 * multiplier
-            dynIsfResult.variableSensitivity = Round.roundTo(1800 / (dynIsfResult.tdd!! * (ln((glucoseStatus.glucose / dynIsfResult.insulinDivisor) + 1))), 0.1)
-            aapsLogger.debug(LTag.APS, "multiplier=$multiplier dynIsfResult=${dynIsfResult.log()} glucoseStatus=${glucoseStatus.glucose} insulinDivisor=${dynIsfResult.insulinDivisor}")
+        // Absolute sliding 24h TDD (base truth for guardrails)
+        tddCalculator.calculateDaily(-24L, 0L)?.also {
+            dyn.tddLast24H = it.totalAmount
+            dyn.tddLast24HCarbs = it.carbs
         }
-        return dynIsfResult
+        val tdd24 = dyn.tddLast24H
+        if (tdd24 == null || tdd24 <= 0.0) {
+            dyn.tdd = null
+            dyn.variableSensitivity = null
+            dyn.insulinDivisor = 0
+            aapsLogger.debug(LTag.APS, "SIPP ISF: no 24h TDD available → ISF not set (SMB fallback).")
+            return dyn
+        }
+
+        // --- Pull coarse rollups ---
+        val tdd0to6 = tddCalculator.calculateDaily(-6L, 0L)?.totalAmount ?: 0.0
+        val tdd6to12 = tddCalculator.calculateDaily(-12L, -6L)?.totalAmount ?: 0.0
+        val tdd12to24 = tddCalculator.calculateDaily(-24L, -12L)?.totalAmount ?: 0.0
+
+        // --- Try to rebuild 24×1h bins and verify against coarse windows (tolerates true zeros) ---
+        val hourly = DoubleArray(24) { h ->
+            tddCalculator.calculateDaily(-(h + 1L), -h.toLong())?.totalAmount ?: 0.0
+        }
+        val hourlySum = hourly.sum()
+        val hourly0to6 = hourly.sliceArray(0 until 6).sum()
+        val hourly6to12 = hourly.sliceArray(6 until 12).sum()
+        val hourly12to24 = hourly.sliceArray(12 until 24).sum()
+
+        // Tolerances: relative 10% or absolute 0.5 U (whichever is larger) per window
+        fun withinTol(meas: Double, ref: Double): Boolean {
+            val tol = maxOf(0.5, 0.10 * ref)
+            return kotlin.math.abs(meas - ref) <= tol
+        }
+
+        val hourVs24Ok = withinTol(hourlySum, tdd24)
+        val hourVs0to6Ok = withinTol(hourly0to6, tdd0to6)
+        val hourVs6to12Ok = withinTol(hourly6to12, tdd6to12)
+        val hourVs12to24Ok = withinTol(hourly12to24, tdd12to24)
+
+        val hourlyCoverageOk = hourVs24Ok && hourVs0to6Ok && hourVs6to12Ok && hourVs12to24Ok
+
+        // --- Compute instant TDD ---
+        val instantTdd: Double = if (hourlyCoverageOk) {
+            // Exponential half-life 6h (true instant): weight[h] = 0.5^(h/6)
+            val halfLife = 6.0
+            val decayPerHour = 0.5.pow(1.0 / halfLife) // ≈ 0.8909
+            var w = 1.0
+            var wSum = 0.0
+            var twSum = 0.0
+            for (h in 0 until 24) {
+                if (h > 0) w *= decayPerHour
+                wSum += w
+                twSum += w * hourly[h]
+            }
+            val expInstant = if (wSum > 0.0) (twSum / wSum) else tdd24
+            aapsLogger.debug(
+                LTag.APS,
+                "SIPP ISF: HOURLY exponential (H=6h) ok; hourlySum=%.2f/24h=%.2f; windows ok → instant=%.2f"
+                    .format(hourlySum, tdd24, expInstant)
+            )
+            expInstant
+        } else {
+            // Robust 6h segments
+            val w0to6 = 0.60
+            val w6to12 = 0.25
+            val w12to24 = 0.15
+            val segInstant = (w0to6 * tdd0to6) + (w6to12 * tdd6to12) + (w12to24 * tdd12to24)
+
+            // Reuse panel telemetry fields meaningfully
+            dyn.tddLast4H = tdd0to6                 // label as "last 6h" if needed
+            dyn.tddLast8to4H = tdd6to12 + tdd12to24 // label as "last 6–24h"
+
+            aapsLogger.debug(
+                LTag.APS,
+                "SIPP ISF: Using 6h segments; 0–6=%.2f 6–12=%.2f 12–24=%.2f → instant=%.2f (hourly coverage not reliable)"
+                    .format(tdd0to6, tdd6to12, tdd12to24, segInstant)
+            )
+            segInstant
+        }
+
+        // --- Dynamic guardrails vs measured 24h ---
+// Base ±35% band; widen *downward* if recent 0–6h is materially lower than 12–24h,
+// widen *upward* if recent 0–6h is materially higher.
+//
+// This version is friendlier to "basal-only fasting" (not zero): it starts widening
+// when recent is ~20% lower than prior, and widens smoothly. Same idea on the upside.
+        var guardDown = 0.35
+        var guardUp = 0.35
+
+        val prior6hAvg = if (tdd12to24 > 0.0) tdd12to24 / 2.0 else 0.0
+        if (prior6hAvg > 0.0) {
+            val ratio = tdd0to6 / prior6hAvg  // recent / prior
+
+            // Downside: if recent is lower than prior, widen from 0.35 up to 0.45 as ratio drops from 0.8→0.5
+            if (ratio < 0.8) {
+                val scale = ((0.8 - ratio).coerceIn(0.0, 0.3) / 0.3) // 0 at 0.8 … 1 at 0.5
+                guardDown = 0.35 + 0.10 * scale                       // 0.35 … 0.45
+            }
+            // Upside: if recent is higher than prior, widen from 0.35 up to 0.45 as ratio rises from 1.25→1.6
+            if (ratio > 1.25) {
+                val scale = ((ratio - 1.25).coerceIn(0.0, 0.35) / 0.35) // 0 at 1.25 … 1 at 1.6
+                guardUp = 0.35 + 0.10 * scale                           // 0.35 … 0.45
+            }
+        }
+
+        val minTdd = tdd24 * (1.0 - guardDown)
+        val maxTdd = tdd24 * (1.0 + guardUp)
+        val clampedTdd = instantTdd.coerceIn(minTdd, maxTdd)
+
+        // Do NOT scale measured TDD by EPS percentage: TDD already reflects delivered insulin.
+        val effectiveTdd = clampedTdd.coerceAtLeast(0.1)
+
+        // Final ISF in mg/dL/U (OpenAPS expects mg/dL): 1800 / TDD
+        dyn.tdd = effectiveTdd
+        dyn.variableSensitivity = Round.roundTo(1800.0 / effectiveTdd, 0.1)
+        dyn.insulinDivisor = 0 // explicitly disable legacy glucose-dependent ln() path
+
+        // Debug log (both units)
+        val isfMgdl = dyn.variableSensitivity ?: 0.0
+        val isfMmol = isfMgdl / 18.0
+        aapsLogger.debug(
+            LTag.APS,
+            "SIPP ISF: 24h=%.2f U → instant=%.2f → clamp[%.2f..%.2f]=%.2f (down=±%.0f%% up=±%.0f%%) → ISF=%.1f mg/dL/U (%.2f mmol/L/U)"
+                .format(tdd24, instantTdd, minTdd, maxTdd, clampedTdd, guardDown * 100, guardUp * 100, isfMgdl, isfMmol)
+        )
+
+        return dyn
     }
 
     override fun invoke(initiator: String, tempBasalFallback: Boolean) {
