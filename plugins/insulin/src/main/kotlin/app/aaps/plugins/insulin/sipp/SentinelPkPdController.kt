@@ -10,9 +10,9 @@ import kotlin.math.sqrt
 /**
  * SIPP = Sentinel Instant PK/PD Controller
  *
- * - Never shortens DIA due to residual/slope (safer for slow sites/stacking).
- * - Persists per site; seeds from Profile (not 10 h) on first tick.
- * - Safety rails + decay to profile; no tightening while falling BG, neg IOB, or suspend.
+ * - Never shortens DIA from residual/slope alone (safer for slow sites/stacking).
+ * - Persists per site; seeds from Profile on first tick if nothing saved.
+ * - Safety rails + gentle decay to profile; no tightening while falling BG, neg IOB, or suspend.
  * - Exposes diagnostics so you can verify accuracy (RMSE/Bias/Confidence).
  *
  * Call applyEvidence() once per loop; read current() from your insulin plugin.
@@ -24,13 +24,13 @@ class SentinelPkPdController @Inject constructor() {
 
     data class Estimates(
         val diaH: Float,     // hours
-        val peakH: Float?,   // hours (nullable => use profile peak)
+        val peakH: Float?,   // hours (nullable => use profile peak if you prefer)
         val isfScale: Float  // ×1.00 = no change
     )
 
     data class Diagnostics(
-        val rmse: Float,     // same units as CGM (mg/dL typically)
-        val bias: Float,     // mean residual; negative => insulin stronger than model
+        val rmse: Float,      // same units as CGM (mg/dL typically)
+        val bias: Float,      // mean residual; negative => insulin stronger than model
         val confidence: Float // 0..1 (higher => more trustworthy)
     )
 
@@ -66,28 +66,35 @@ class SentinelPkPdController @Inject constructor() {
         basePeakMin: Int
     ) = synchronized(this) {
 
-        val hadSaved = tryRestoreOnce()
-        if (!hadSaved && !seededFromProfile) {
-            val ceil = if (SippPrefs.allowDiaAbove9h()) DIA_MAX else 12.0f
-            diaH = baseDiaH.coerceIn(DIA_MIN, ceil)
+        // One-time restore from persisted state.
+        val restoredNow = tryRestoreOnce()
+
+        // If nothing restored and not seeded yet, seed from current profile.
+        if (!restoredNow && !seededFromProfile) {
+            val diaCeil = if (SippPrefs.allowDiaAbove9h()) DIA_MAX else 9.0f
+            diaH = baseDiaH.coerceIn(DIA_MIN, diaCeil)
             tPeakMin = basePeakMin.coerceIn(TPEAK_MIN_MIN, TPEAK_MAX_MIN)
             isfMult = 1.00f
             seededFromProfile = true
         }
 
+        // dt (minutes) for smooth decay/tweening
         val dtMin = if (lastTickMs == 0L) 5.0f else max(1L, nowMs - lastTickMs) / 60000.0f
+        lockoutMin = (lockoutMin - dtMin).coerceAtLeast(0f)
         lastTickMs = nowMs
 
+        // If PK is disabled or sensor is bad → gently drift toward profile targets and persist.
         if (!SippPrefs.enablePk() || !sensorOk) {
             decayToward(baseDiaH, basePeakMin, 1.0f, dtMin)
             persist(nowMs)
             return
         }
 
-        val residual = (bgNow - bgPred).toFloat() // negative => insulin stronger
+        // Residual = actual - predicted (negative => insulin stronger than model)
+        val residual = (bgNow - bgPred).toFloat()
         pushTelem(residual)
 
-        // Sentinels
+        // Situational sentinels
         val earlySite = siteAgeHours < 24.0
         val stack = minutesSinceLastBolus in 1..120
         val falling = deltaPerMin < -0.05
@@ -122,12 +129,16 @@ class SentinelPkPdController @Inject constructor() {
             diaH += DIA_STEP_UP
             tPeakMin += TPEAK_STEP_MIN
             isfMult += ISF_STEP_WEAKEN
+            quietMin = 0f
+            lockoutMin = STRONG_LOCKOUT_MIN
         } else if (weakInsulin) {
             // insulin weaker → DO NOT shorten DIA; adjust ISF/peak gently
             isfMult -= ISF_STEP_STRENGTHEN
             tPeakMin -= TPEAK_STEP_MIN
+            quietMin += dtMin
         } else {
             // quiet → slow decay toward profile & activity targets
+            quietMin += if (!falling && !negIob && !prolongedSuspend) dtMin else 0f
             decayToward(baseDiaH, targetPeakMin, targetIsfMult, dtMin)
         }
 
@@ -148,36 +159,48 @@ class SentinelPkPdController @Inject constructor() {
 
     // ---------------- internals ----------------
 
-    // Rails (ALL_CAPS constants are conventional in this codebase)
-    private val DIA_MIN = 5.0f
-    private val DIA_MAX = 20.0f
-    private val TPEAK_MIN_MIN = 50
-    private val TPEAK_MAX_MIN = 180
-    private val ISF_MIN = 0.60f
-    private val ISF_MAX = 1.40f
+    companion object {
 
-    // Steps / decay
-    private val DIA_STEP_UP = 0.25f
-    private val TPEAK_STEP_MIN = 3
-    private val ISF_STEP_WEAKEN = 0.02f
-    private val ISF_STEP_STRENGTHEN = 0.02f
-    private val DECAY_PER_H = 0.08f
+        // --- Relaxation gate (allows DIA to come down safely) ---
+        private const val RELAX_UNLOCK_CONF: Float = 0.65f   // confidence ≥ this to allow shortening
+        private const val RELAX_AFTER_MIN: Float = 45f     // need this many quiet minutes before relaxing
+        private const val RELAX_RATE_PER_H: Float = 0.05f   // max downward relaxation per hour (soft)
+        private const val STRONG_LOCKOUT_MIN: Float = 30f     // after strong insulin, block relaxing for X min
 
-    // Slow-site aids
-    private val DIA_FLOOR_SOFT = 9.0f
-    private val DIA_FLOOR_HARD = 14.0f
+        // Rails
+        private const val DIA_MIN: Float = 4.5f
+        private const val DIA_MAX: Float = 24.0f
+        private const val TPEAK_MIN_MIN: Int = 45
+        private const val TPEAK_MAX_MIN: Int = 210
+        private const val ISF_MIN: Float = 0.60f
+        private const val ISF_MAX: Float = 1.50f
 
-    // Residual telemetry
-    private val RESIDUAL_TH_STRONG = 6.0f
-    private val CUSUM_DECAY = 0.85f
+        // Steps / decay
+        private const val DIA_STEP_UP: Float = 0.25f
+        private const val TPEAK_STEP_MIN: Int = 3
+        private const val ISF_STEP_WEAKEN: Float = 0.02f
+        private const val ISF_STEP_STRENGTHEN: Float = 0.02f
+        private const val DECAY_PER_H: Float = 0.08f
 
-    // State
-    @Volatile private var diaH: Float = 10.0f
-    @Volatile private var tPeakMin: Int = 133
+        // Slow-site aids
+        private const val DIA_FLOOR_SOFT: Float = 9.0f
+        private const val DIA_FLOOR_HARD: Float = 14.0f
+
+        // Residual telemetry
+        private const val RESIDUAL_TH_STRONG: Float = 6.0f
+        private const val CUSUM_DECAY: Float = 0.85f
+    }
+
+    // State (timers & dynamics)
+    @Volatile private var quietMin: Float = 0f
+    @Volatile private var lockoutMin: Float = 0f
+
+    @Volatile private var diaH: Float = 9.0f
+    @Volatile private var tPeakMin: Int = 120
     @Volatile private var isfMult: Float = 1.00f
     @Volatile private var lastTickMs: Long = 0L
-    @Volatile private var restored = false
-    @Volatile private var seededFromProfile = false
+    @Volatile private var restored: Boolean = false
+    @Volatile private var seededFromProfile: Boolean = false
 
     // Telemetry accumulators
     private var sumSq: Float = 0f
@@ -203,9 +226,27 @@ class SentinelPkPdController @Inject constructor() {
 
     private fun decayToward(baseDiaH: Float, targetPeakMin: Int, targetIsfMult: Float, dtMin: Float) {
         val k = DECAY_PER_H * (dtMin / 60.0f)
-        // NEVER shorten DIA below base here; bias toward longer horizon
-        val diaTarget = max(baseDiaH, diaH)
-        diaH += (diaTarget - diaH) * k
+
+        // Gate to allow shortening DIA only when clearly safe
+        val allowRelax =
+            lockoutMin <= 0f &&
+                calcConfidence() >= RELAX_UNLOCK_CONF &&
+                quietMin >= RELAX_AFTER_MIN
+
+        // If allowed, target is baseline; otherwise never shorter than current
+        val diaTarget = if (allowRelax) baseDiaH else max(baseDiaH, diaH)
+
+        // Apply a gentle cap on per-tick downward move (battery-neutral O(1))
+        val nextDia = diaH + (diaTarget - diaH) * k
+        val maxDownStep = (RELAX_RATE_PER_H * (dtMin / 60.0f))
+        diaH = if (allowRelax && nextDia < diaH) {
+            // limit downward speed
+            max(nextDia, diaH - maxDownStep)
+        } else {
+            nextDia
+        }
+
+        // Peak & ISF tween
         tPeakMin += ((targetPeakMin - tPeakMin).toFloat() * k).toInt()
         isfMult += (targetIsfMult - isfMult) * k
     }
