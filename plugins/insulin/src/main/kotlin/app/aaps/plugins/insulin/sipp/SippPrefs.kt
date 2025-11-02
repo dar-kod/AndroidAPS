@@ -4,11 +4,12 @@ import android.content.Context
 import android.content.SharedPreferences
 import androidx.core.content.edit
 import androidx.preference.PreferenceManager
+import org.json.JSONObject
 
 /**
  * Plugin-local prefs for SIPP. No core keys, no MainApp.
  * Call SippPrefs.init(context) once before reading.
- * Defaults are ON to keep SIPP "no-knobs" by default.
+ * Defaults are OFF unless set by user to avoid surprises.
  */
 object SippPrefs {
 
@@ -18,80 +19,62 @@ object SippPrefs {
         sp = PreferenceManager.getDefaultSharedPreferences(context.applicationContext)
     }
 
-    // New canonical keys (uppercase SIPP)
+    // Canonical feature keys
     private const val K_ENABLE_PK = "SIPP_enable_pk"
     private const val K_ENABLE_ISF = "SIPP_enable_isf"
     private const val K_ALLOW_DIA_ABOVE_9H = "SIPP_allow_dia_above_9h"
     private const val K_SITE_LOCATION = "SIPP_site_location"   // "ABDOMEN" | "ARM" | "THIGH"
     private const val K_SITE_AGE_ENABLED = "SIPP_site_age_enabled"
-    private const val K_SITE_AGE_H = "SIPP_site_age_h"      // string hours
+    private const val K_SITE_AGE_H = "SIPP_site_age_h"         // string hours
 
-    // Legacy keys (lowercase) kept only for migration
-    private const val L_ENABLE_PK = "sipp_enable_pk"
-    private const val L_ENABLE_ISF = "sipp_enable_isf"
-    private const val L_ALLOW_DIA_ABOVE_9H = "sipp_allow_dia_above_9h"
-    private const val L_SITE_LOCATION = "sipp_site_location"
-    private const val L_SITE_AGE_ENABLED = "sipp_site_age_enabled"
-    private const val L_SITE_AGE_H = "sipp_site_age_h"
-
-    // Persisted live PK/PD state (unchanged)
+    // Persisted live PK/PD state (for continuity across APK updates)
     private const val K_STATE_DIA_H = "SIPP_state_dia_h"
     private const val K_STATE_TPEAK_MIN = "SIPP_state_tpeak_min"
     private const val K_STATE_ISF_MULT = "SIPP_state_isf_mult"
     private const val K_STATE_TS_MS = "SIPP_state_timestamp_ms"
 
-    // --- migration helpers ---
-    private fun getBoolMigrate(newK: String, oldK: String, def: Boolean): Boolean {
-        val p = sp ?: return def
-        if (p.contains(newK)) return p.getBoolean(newK, def)
-        if (p.contains(oldK)) {
-            val v = p.getBoolean(oldK, def)
-            p.edit { putBoolean(newK, v); remove(oldK) }
-            return v
-        }
-        return def
+    // ISF readouts (USED = what dosing used; RAW = exp-TDD instant, unscaled)
+    private const val K_LAST_ISF_USED_MGDL = "SIPP_last_isf_used_mgdl"
+    private const val K_LAST_ISF_USED_TS = "SIPP_last_isf_used_ts"
+    private const val K_LAST_ISF_RAW_MGDL = "SIPP_last_isf_raw_mgdl"
+    private const val K_LAST_ISF_RAW_TS = "SIPP_last_isf_raw_ts"
+
+    // Context for the last saved USED ISF (for UI hinting at lows)
+    private const val K_LAST_ISF_BG_MGDL = "SIPP_last_isf_bg_mgdl"
+    private const val K_LAST_ISF_TARGETLOW_MGDL = "SIPP_last_isf_targetlow_mgdl"
+
+    // --- simple helpers ---
+    private fun getBool(key: String): Boolean = sp?.getBoolean(key, false) ?: false
+    private fun setBool(key: String, v: Boolean) {
+        sp?.edit { putBoolean(key, v) }
     }
 
-    private fun setBool(newK: String, v: Boolean) {
-        sp?.edit { putBoolean(newK, v) }
+    private fun getString(key: String, def: String): String = sp?.getString(key, def) ?: def
+    private fun setString(key: String, v: String) {
+        sp?.edit { putString(key, v) }
     }
 
-    private fun getStringMigrate(newK: String, oldK: String, def: String): String {
-        val p = sp ?: return def
-        if (p.contains(newK)) return p.getString(newK, def) ?: def
-        if (p.contains(oldK)) {
-            val v = p.getString(oldK, def) ?: def
-            p.edit { putString(newK, v); remove(oldK) }
-            return v
-        }
-        return def
-    }
-
-    private fun setString(newK: String, v: String) {
-        sp?.edit { putString(newK, v) }
-    }
-
-    // --- feature toggles (defaults ON) ---
-    fun enablePk(): Boolean = getBoolMigrate(K_ENABLE_PK, L_ENABLE_PK, true)
+    // --- feature toggles (defaults OFF, user controls) ---
+    fun enablePk(): Boolean = getBool(K_ENABLE_PK)
     fun setEnablePk(v: Boolean) = setBool(K_ENABLE_PK, v)
 
-    fun enableIsf(): Boolean = getBoolMigrate(K_ENABLE_ISF, L_ENABLE_ISF, true)
+    fun enableIsf(): Boolean = getBool(K_ENABLE_ISF)
     fun setEnableIsf(v: Boolean) = setBool(K_ENABLE_ISF, v)
 
-    fun allowDiaAbove9h(): Boolean = getBoolMigrate(K_ALLOW_DIA_ABOVE_9H, L_ALLOW_DIA_ABOVE_9H, true)
+    fun allowDiaAbove9h(): Boolean = getBool(K_ALLOW_DIA_ABOVE_9H)
     fun setAllowDiaAbove9h(v: Boolean) = setBool(K_ALLOW_DIA_ABOVE_9H, v)
 
     // --- optional site context ---
-    fun siteLocation(): String = getStringMigrate(K_SITE_LOCATION, L_SITE_LOCATION, "ABDOMEN")
+    fun siteLocation(): String = getString(K_SITE_LOCATION, "ABDOMEN")
     fun setSiteLocation(v: String) = setString(K_SITE_LOCATION, v)
 
-    fun siteAgeEnabled(): Boolean = getBoolMigrate(K_SITE_AGE_ENABLED, L_SITE_AGE_ENABLED, false)
+    fun siteAgeEnabled(): Boolean = getBool(K_SITE_AGE_ENABLED)
     fun setSiteAgeEnabled(v: Boolean) = setBool(K_SITE_AGE_ENABLED, v)
 
-    fun siteAgeH(): String = getStringMigrate(K_SITE_AGE_H, L_SITE_AGE_H, "1")
+    fun siteAgeH(): String = getString(K_SITE_AGE_H, "1")
     fun setSiteAgeH(v: String) = setString(K_SITE_AGE_H, v)
 
-    // --- live state get/set (unchanged) ---
+    // --- live PK state get/set ---
     data class SavedState(
         val diaH: Float,
         val tPeakMin: Int,
@@ -99,12 +82,13 @@ object SippPrefs {
         val savedAtMs: Long
     )
 
+    /** Returns last persisted PK state or null if never saved. */
     fun loadState(): SavedState? {
         val p = sp ?: return null
         if (!p.contains(K_STATE_DIA_H) || !p.contains(K_STATE_TPEAK_MIN) || !p.contains(K_STATE_ISF_MULT))
             return null
-        val dia = p.getFloat(K_STATE_DIA_H, 10.0f)
-        val tp = p.getInt(K_STATE_TPEAK_MIN, 133)
+        val dia = p.getFloat(K_STATE_DIA_H, 9.0f)
+        val tp = p.getInt(K_STATE_TPEAK_MIN, 120)
         val isf = p.getFloat(K_STATE_ISF_MULT, 1.0f)
         val ts = p.getLong(K_STATE_TS_MS, 0L)
         return SavedState(dia, tp, isf, ts)
@@ -117,5 +101,115 @@ object SippPrefs {
             putFloat(K_STATE_ISF_MULT, isfMult)
             putLong(K_STATE_TS_MS, nowMs)
         }
+    }
+
+    // --- ISF persistence ---
+    /** ISF the algorithm actually used for dosing (mg/dL per U), with UI context at save-time. */
+    fun saveLastInstantIsfMgdl(isfMgdl: Double, tsMs: Long, bgMgdl: Double? = null, targetLowMgdl: Double? = null) {
+        sp?.edit {
+            putFloat(K_LAST_ISF_USED_MGDL, isfMgdl.toFloat())
+            putLong(K_LAST_ISF_USED_TS, tsMs)
+            if (bgMgdl != null) putFloat(K_LAST_ISF_BG_MGDL, bgMgdl.toFloat())
+            if (targetLowMgdl != null) putFloat(K_LAST_ISF_TARGETLOW_MGDL, targetLowMgdl.toFloat())
+        }
+    }
+
+    fun lastInstantIsfMgdl(): Double? {
+        val p = sp ?: return null
+        if (!p.contains(K_LAST_ISF_USED_MGDL)) return null
+        return p.getFloat(K_LAST_ISF_USED_MGDL, 0f).toDouble()
+    }
+
+    fun lastInstantIsfTsMs(): Long? {
+        val p = sp ?: return null
+        if (!p.contains(K_LAST_ISF_USED_TS)) return null
+        return p.getLong(K_LAST_ISF_USED_TS, 0L)
+    }
+
+    fun lastIsfContext(): Pair<Double?, Double?> {
+        val p = sp ?: return Pair(null, null)
+        val bg = if (p.contains(K_LAST_ISF_BG_MGDL)) p.getFloat(K_LAST_ISF_BG_MGDL, 0f).toDouble() else null
+        val low = if (p.contains(K_LAST_ISF_TARGETLOW_MGDL)) p.getFloat(K_LAST_ISF_TARGETLOW_MGDL, 0f).toDouble() else null
+        return Pair(bg, low)
+    }
+
+    /** Pure instant SIPP ISF (exp-weighted TDD, unscaled). */
+    fun saveLastRawInstantIsfMgdl(isfMgdl: Double, tsMs: Long) {
+        sp?.edit {
+            putFloat(K_LAST_ISF_RAW_MGDL, isfMgdl.toFloat())
+            putLong(K_LAST_ISF_RAW_TS, tsMs)
+        }
+    }
+
+    fun lastRawInstantIsfMgdl(): Double? {
+        val p = sp ?: return null
+        if (!p.contains(K_LAST_ISF_RAW_MGDL)) return null
+        return p.getFloat(K_LAST_ISF_RAW_MGDL, 0f).toDouble()
+    }
+
+    fun lastRawInstantIsfTsMs(): Long? {
+        val p = sp ?: return null
+        if (!p.contains(K_LAST_ISF_RAW_TS)) return null
+        return p.getLong(K_LAST_ISF_RAW_TS, 0L)
+    }
+
+    // --------- Export / Import (Settings JSON bridging) ----------
+
+    fun packToJson(): JSONObject =
+        JSONObject().apply {
+            put("enablePk", enablePk())
+            put("enableIsf", enableIsf())
+            put("allowDiaAbove9h", allowDiaAbove9h())
+            put("siteLocation", siteLocation())
+            put("siteAgeEnabled", siteAgeEnabled())
+            put("siteAgeH", siteAgeH())
+
+            loadState()?.let {
+                put("state_diaH", it.diaH.toDouble())
+                put("state_tPeakMin", it.tPeakMin)
+                put("state_isfMult", it.isfMult.toDouble())
+                put("state_savedAtMs", it.savedAtMs)
+            }
+
+            lastInstantIsfMgdl()?.let { put("last_isf_used_mgdl", it) }
+            lastInstantIsfTsMs()?.let { put("last_isf_used_ts", it) }
+            lastRawInstantIsfMgdl()?.let { put("last_isf_raw_mgdl", it) }
+            lastRawInstantIsfTsMs()?.let { put("last_isf_raw_ts", it) }
+
+            val (bg, low) = lastIsfContext()
+            bg?.let { put("last_isf_bg_mgdl", it) }
+            low?.let { put("last_isf_targetlow_mgdl", it) }
+        }
+
+    fun applyFromJson(obj: JSONObject?) {
+        if (obj == null) return
+        setEnablePk(obj.optBoolean("enablePk", enablePk()))
+        setEnableIsf(obj.optBoolean("enableIsf", enableIsf()))
+        setAllowDiaAbove9h(obj.optBoolean("allowDiaAbove9h", allowDiaAbove9h()))
+        setSiteLocation(obj.optString("siteLocation", siteLocation()))
+        setSiteAgeEnabled(obj.optBoolean("siteAgeEnabled", siteAgeEnabled()))
+        setSiteAgeH(obj.optString("siteAgeH", siteAgeH()))
+
+        val dia = obj.optDouble("state_diaH", Double.NaN)
+        val tp = obj.optInt("state_tPeakMin", Int.MIN_VALUE)
+        val im = obj.optDouble("state_isfMult", Double.NaN)
+        val ts = obj.optLong("state_savedAtMs", 0L)
+        if (!dia.isNaN() && tp != Int.MIN_VALUE && !im.isNaN() && ts != 0L) {
+            saveState(dia.toFloat(), tp, im.toFloat(), ts)
+        }
+
+        val used = obj.optDouble("last_isf_used_mgdl", Double.NaN)
+        val usedTs = obj.optLong("last_isf_used_ts", 0L)
+        val bg = obj.optDouble("last_isf_bg_mgdl", Double.NaN)
+        val low = obj.optDouble("last_isf_targetlow_mgdl", Double.NaN)
+        if (!used.isNaN() && usedTs != 0L) {
+            val bgOrNull = if (bg.isNaN()) null else bg
+            val lowOrNull = if (low.isNaN()) null else low
+            saveLastInstantIsfMgdl(used, usedTs, bgOrNull, lowOrNull)
+        }
+
+        val raw = obj.optDouble("last_isf_raw_mgdl", Double.NaN)
+        val rawTs = obj.optLong("last_isf_raw_ts", 0L)
+        if (!raw.isNaN() && rawTs != 0L) saveLastRawInstantIsfMgdl(raw, rawTs)
     }
 }
