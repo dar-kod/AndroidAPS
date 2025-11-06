@@ -79,6 +79,8 @@ import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
 import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
 
 @Singleton
 open class OpenAPSSMBPlugin @Inject constructor(
@@ -335,6 +337,30 @@ open class OpenAPSSMBPlugin @Inject constructor(
         return dyn
     }
 
+    /**
+     * Compute & persist SIPP Instant Basal (U/h) and SIPP Max Basal (U/h) based on the ISF actually used.
+     * - Instant basal ≈ 45% of TDD / 24
+     * - Max basal suggestion = max(1.8×scheduled, 3×instantBasal, maxDailyBasal×prefDailyMultiplier),
+     *   clamped to HardLimits.maxBasal().
+     */
+    private fun persistInstantAndMaxBasal(profile: Profile, sensMgdl: Double) {
+        if (sensMgdl <= 0.0) return
+        val tddEst = 1800.0 / sensMgdl
+        val instantBasal = Round.roundTo(0.45 * tddEst / 24.0, 0.01)
+
+        val scheduled = profile.getBasal()
+        val fromMultiplier = scheduled * 1.8
+        val fromInstant = instantBasal * 3.0
+        val fromDaily = profile.getMaxDailyBasal() * preferences.get(DoubleKey.ApsMaxDailyMultiplier)
+
+        val unclampedMax = max(fromMultiplier, max(fromInstant, fromDaily))
+        val suggestedMax = Round.roundTo(unclampedMax.coerceAtMost(hardLimits.maxBasal()), 0.01)
+
+        val nowTs = dateUtil.now()
+        runCatching { SippPrefs.saveLastInstantBasalUph(instantBasal, nowTs) }
+        runCatching { SippPrefs.saveLastMaxBasalUph(suggestedMax, nowTs) }
+    }
+
     override fun invoke(initiator: String, tempBasalFallback: Boolean) {
         aapsLogger.debug(LTag.APS, "invoke from $initiator tempBasalFallback: $tempBasalFallback")
         lastAPSResult = null
@@ -539,6 +565,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
             else                                                                    -> baseIsfMgdl
         }
 
+        // Persist ISF readouts (used and raw)
         runCatching { SippPrefs.saveLastInstantIsfMgdl(sensForJs, now) }
         runCatching {
             val rawInstantIsfFromExp = dynIsfResult.variableSensitivity
@@ -546,6 +573,9 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 SippPrefs.saveLastRawInstantIsfMgdl(rawInstantIsfFromExp, now)
             }
         }
+
+        // Persist Instant Basal & Max Basal derived from the ISF actually used (with timestamp)
+        persistInstantAndMaxBasal(profile, sensForJs)
 
         runCatching {
             val unitsMmol = (profileFunction.getUnits() == GlucoseUnit.MMOL)
@@ -564,13 +594,28 @@ open class OpenAPSSMBPlugin @Inject constructor(
             )
         }
 
+        // ==== Inject SIPP Instant Basal & Max Basal into the JS profile when toggles are ON ====
+        val sippInstantBasal = if (SippPrefs.enableBasal()) SippPrefs.lastInstantBasalUph() else null
+        val currentBasalForJs = if (sippInstantBasal != null && sippInstantBasal > 0.0) {
+            sippInstantBasal.coerceAtMost(hardLimits.maxBasal())
+        } else {
+            activePlugin.activePump.baseBasalRate
+        }
+
+        val sippMaxBasalForJs = if (SippPrefs.enableMaxBasal()) SippPrefs.lastMaxBasalUph() else null
+        val maxBasalForJs = if (sippMaxBasalForJs != null && sippMaxBasalForJs > 0.0) {
+            sippMaxBasalForJs.coerceAtMost(hardLimits.maxBasal())
+        } else {
+            constraintsChecker.getMaxBasalAllowed(profile).also { inputConstraints.copyReasons(it) }.value()
+        }
+
         @Suppress("KotlinConstantConditions")
         val oapsProfile = OapsProfile(
             dia = 0.0,
             min_5m_carbimpact = 0.0,
             max_iob = constraintsChecker.getMaxIOBAllowed().also { inputConstraints.copyReasons(it) }.value(),
             max_daily_basal = profile.getMaxDailyBasal(),
-            max_basal = constraintsChecker.getMaxBasalAllowed(profile).also { inputConstraints.copyReasons(it) }.value(),
+            max_basal = maxBasalForJs,
             min_bg = minBg,
             max_bg = maxBg,
             target_bg = targetBg,
@@ -602,7 +647,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
             maxUAMSMBBasalMinutes = preferences.get(IntKey.ApsUamMaxMinutesOfBasalToLimitSmb),
             bolus_increment = pump.pumpDescription.bolusStep,
             carbsReqThreshold = preferences.get(IntKey.ApsCarbsRequestThreshold),
-            current_basal = activePlugin.activePump.baseBasalRate,
+            current_basal = currentBasalForJs,
             temptargetSet = isTempTarget,
             autosens_max = preferences.get(DoubleKey.AutosensMax),
             out_units = if (profileFunction.getUnits() == GlucoseUnit.MMOL) "mmol/L" else "mg/dl",
@@ -673,23 +718,58 @@ open class OpenAPSSMBPlugin @Inject constructor(
 
     override fun applyBasalConstraints(absoluteRate: Constraint<Double>, profile: Profile): Constraint<Double> {
         if (isEnabled()) {
-            var maxBasal = preferences.get(DoubleKey.ApsMaxBasal)
-            if (maxBasal < profile.getMaxDailyBasal()) {
-                maxBasal = profile.getMaxDailyBasal()
-                absoluteRate.addReason(rh.gs(R.string.increasing_max_basal), this)
-            }
-            absoluteRate.setIfSmaller(maxBasal, rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxBasal, rh.gs(R.string.maxvalueinpreferences)), this)
+            val sippMaxBasal = if (SippPrefs.enableMaxBasal()) SippPrefs.lastMaxBasalUph() else null
+            if (sippMaxBasal != null && sippMaxBasal > 0.0) {
+                // SIPP Max Basal path: we treat SIPP suggestion as primary cap,
+                // but still honor multipliers + daily safety and hard limits.
+                var maxBasal = sippMaxBasal.coerceAtMost(hardLimits.maxBasal())
 
-            val maxBasalMultiplier = preferences.get(DoubleKey.ApsMaxCurrentBasalMultiplier)
-            val maxFromBasalMultiplier = floor(maxBasalMultiplier * profile.getBasal() * 100) / 100
-            absoluteRate.setIfSmaller(
-                maxFromBasalMultiplier,
-                rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxFromBasalMultiplier, rh.gs(R.string.max_basal_multiplier)),
-                this
-            )
-            val maxBasalFromDaily = preferences.get(DoubleKey.ApsMaxDailyMultiplier)
-            val maxFromDaily = floor(profile.getMaxDailyBasal() * maxBasalFromDaily * 100) / 100
-            absoluteRate.setIfSmaller(maxFromDaily, rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxFromDaily, rh.gs(R.string.max_daily_basal_multiplier)), this)
+                val maxBasalMultiplier = preferences.get(DoubleKey.ApsMaxCurrentBasalMultiplier)
+                val maxFromBasalMultiplier = floor(maxBasalMultiplier * profile.getBasal() * 100) / 100
+                if (maxFromBasalMultiplier > 0.0) {
+                    maxBasal = min(maxBasal, maxFromBasalMultiplier)
+                }
+
+                val maxBasalFromDaily = preferences.get(DoubleKey.ApsMaxDailyMultiplier)
+                val maxFromDaily = floor(profile.getMaxDailyBasal() * maxBasalFromDaily * 100) / 100
+                if (maxFromDaily > 0.0) {
+                    maxBasal = min(maxBasal, maxFromDaily)
+                }
+
+                absoluteRate.setIfSmaller(
+                    maxBasal,
+                    rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxBasal, "SIPP max basal"),
+                    this
+                )
+            } else {
+                // Original behavior (no SIPP override / no value yet)
+                var maxBasal = preferences.get(DoubleKey.ApsMaxBasal)
+                if (maxBasal < profile.getMaxDailyBasal()) {
+                    maxBasal = profile.getMaxDailyBasal()
+                    absoluteRate.addReason(rh.gs(R.string.increasing_max_basal), this)
+                }
+                absoluteRate.setIfSmaller(
+                    maxBasal,
+                    rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxBasal, rh.gs(R.string.maxvalueinpreferences)),
+                    this
+                )
+
+                val maxBasalMultiplier = preferences.get(DoubleKey.ApsMaxCurrentBasalMultiplier)
+                val maxFromBasalMultiplier = floor(maxBasalMultiplier * profile.getBasal() * 100) / 100
+                absoluteRate.setIfSmaller(
+                    maxFromBasalMultiplier,
+                    rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxFromBasalMultiplier, rh.gs(R.string.max_basal_multiplier)),
+                    this
+                )
+
+                val maxBasalFromDaily = preferences.get(DoubleKey.ApsMaxDailyMultiplier)
+                val maxFromDaily = floor(profile.getMaxDailyBasal() * maxBasalFromDaily * 100) / 100
+                absoluteRate.setIfSmaller(
+                    maxFromDaily,
+                    rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxFromDaily, rh.gs(R.string.max_daily_basal_multiplier)),
+                    this
+                )
+            }
         }
         return absoluteRate
     }

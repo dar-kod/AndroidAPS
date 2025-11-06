@@ -23,6 +23,11 @@ object SippPrefs {
     private const val K_ENABLE_PK = "SIPP_enable_pk"
     private const val K_ENABLE_ISF = "SIPP_enable_isf"
     private const val K_ALLOW_DIA_ABOVE_9H = "SIPP_allow_dia_above_9h"
+
+    // NEW: toggles for Instant Basal and Max Basal
+    private const val K_ENABLE_BASAL = "SIPP_enable_basal"
+    private const val K_ENABLE_MAX_BASAL = "SIPP_enable_max_basal"
+
     private const val K_SITE_LOCATION = "SIPP_site_location"   // "ABDOMEN" | "ARM" | "THIGH"
     private const val K_SITE_AGE_ENABLED = "SIPP_site_age_enabled"
     private const val K_SITE_AGE_H = "SIPP_site_age_h"         // string hours
@@ -42,6 +47,12 @@ object SippPrefs {
     // Context for the last saved USED ISF (for UI hinting at lows)
     private const val K_LAST_ISF_BG_MGDL = "SIPP_last_isf_bg_mgdl"
     private const val K_LAST_ISF_TARGETLOW_MGDL = "SIPP_last_isf_targetlow_mgdl"
+
+    // Instant basal & suggested max basal (U/h)
+    private const val K_LAST_INST_BASAL_UPH = "SIPP_last_instant_basal_uph"
+    private const val K_LAST_INST_BASAL_TS = "SIPP_last_instant_basal_ts"
+    private const val K_LAST_MAX_BASAL_UPH = "SIPP_last_max_basal_uph"
+    private const val K_LAST_MAX_BASAL_TS = "SIPP_last_max_basal_ts"
 
     // --- simple helpers ---
     private fun getBool(key: String): Boolean = sp?.getBoolean(key, false) ?: false
@@ -63,6 +74,13 @@ object SippPrefs {
 
     fun allowDiaAbove9h(): Boolean = getBool(K_ALLOW_DIA_ABOVE_9H)
     fun setAllowDiaAbove9h(v: Boolean) = setBool(K_ALLOW_DIA_ABOVE_9H, v)
+
+    // NEW: SIPP Instant Basal + Max Basal toggles
+    fun enableBasal(): Boolean = getBool(K_ENABLE_BASAL)
+    fun setEnableBasal(v: Boolean) = setBool(K_ENABLE_BASAL, v)
+
+    fun enableMaxBasal(): Boolean = getBool(K_ENABLE_MAX_BASAL)
+    fun setEnableMaxBasal(v: Boolean) = setBool(K_ENABLE_MAX_BASAL, v)
 
     // --- optional site context ---
     fun siteLocation(): String = getString(K_SITE_LOCATION, "ABDOMEN")
@@ -153,6 +171,45 @@ object SippPrefs {
         return p.getLong(K_LAST_ISF_RAW_TS, 0L)
     }
 
+    // --- Instant basal & suggested max basal (U/h) ---
+    fun saveLastInstantBasalUph(uph: Double, tsMs: Long) {
+        sp?.edit {
+            putFloat(K_LAST_INST_BASAL_UPH, uph.toFloat())
+            putLong(K_LAST_INST_BASAL_TS, tsMs)
+        }
+    }
+
+    fun lastInstantBasalUph(): Double? {
+        val p = sp ?: return null
+        if (!p.contains(K_LAST_INST_BASAL_UPH)) return null
+        return p.getFloat(K_LAST_INST_BASAL_UPH, 0f).toDouble()
+    }
+
+    fun lastInstantBasalTsMs(): Long? {
+        val p = sp ?: return null
+        if (!p.contains(K_LAST_INST_BASAL_TS)) return null
+        return p.getLong(K_LAST_INST_BASAL_TS, 0L)
+    }
+
+    fun saveLastMaxBasalUph(uph: Double, tsMs: Long) {
+        sp?.edit {
+            putFloat(K_LAST_MAX_BASAL_UPH, uph.toFloat())
+            putLong(K_LAST_MAX_BASAL_TS, tsMs)
+        }
+    }
+
+    fun lastMaxBasalUph(): Double? {
+        val p = sp ?: return null
+        if (!p.contains(K_LAST_MAX_BASAL_UPH)) return null
+        return p.getFloat(K_LAST_MAX_BASAL_UPH, 0f).toDouble()
+    }
+
+    fun lastMaxBasalTsMs(): Long? {
+        val p = sp ?: return null
+        if (!p.contains(K_LAST_MAX_BASAL_TS)) return null
+        return p.getLong(K_LAST_MAX_BASAL_TS, 0L)
+    }
+
     // --------- Export / Import (Settings JSON bridging) ----------
 
     fun packToJson(): JSONObject =
@@ -160,6 +217,8 @@ object SippPrefs {
             put("enablePk", enablePk())
             put("enableIsf", enableIsf())
             put("allowDiaAbove9h", allowDiaAbove9h())
+            put("enableBasal", enableBasal())
+            put("enableMaxBasal", enableMaxBasal())
             put("siteLocation", siteLocation())
             put("siteAgeEnabled", siteAgeEnabled())
             put("siteAgeH", siteAgeH())
@@ -179,6 +238,11 @@ object SippPrefs {
             val (bg, low) = lastIsfContext()
             bg?.let { put("last_isf_bg_mgdl", it) }
             low?.let { put("last_isf_targetlow_mgdl", it) }
+
+            lastInstantBasalUph()?.let { put("last_instant_basal_uph", it) }
+            lastInstantBasalTsMs()?.let { put("last_instant_basal_ts", it) }
+            lastMaxBasalUph()?.let { put("last_max_basal_uph", it) }
+            lastMaxBasalTsMs()?.let { put("last_max_basal_ts", it) }
         }
 
     fun applyFromJson(obj: JSONObject?) {
@@ -186,6 +250,8 @@ object SippPrefs {
         setEnablePk(obj.optBoolean("enablePk", enablePk()))
         setEnableIsf(obj.optBoolean("enableIsf", enableIsf()))
         setAllowDiaAbove9h(obj.optBoolean("allowDiaAbove9h", allowDiaAbove9h()))
+        setEnableBasal(obj.optBoolean("enableBasal", enableBasal()))
+        setEnableMaxBasal(obj.optBoolean("enableMaxBasal", enableMaxBasal()))
         setSiteLocation(obj.optString("siteLocation", siteLocation()))
         setSiteAgeEnabled(obj.optBoolean("siteAgeEnabled", siteAgeEnabled()))
         setSiteAgeH(obj.optString("siteAgeH", siteAgeH()))
@@ -211,5 +277,13 @@ object SippPrefs {
         val raw = obj.optDouble("last_isf_raw_mgdl", Double.NaN)
         val rawTs = obj.optLong("last_isf_raw_ts", 0L)
         if (!raw.isNaN() && rawTs != 0L) saveLastRawInstantIsfMgdl(raw, rawTs)
+
+        val instBasal = obj.optDouble("last_instant_basal_uph", Double.NaN)
+        val instTs = obj.optLong("last_instant_basal_ts", 0L)
+        if (!instBasal.isNaN() && instTs != 0L) saveLastInstantBasalUph(instBasal, instTs)
+
+        val maxBasal = obj.optDouble("last_max_basal_uph", Double.NaN)
+        val maxTs = obj.optLong("last_max_basal_ts", 0L)
+        if (!maxBasal.isNaN() && maxTs != 0L) saveLastMaxBasalUph(maxBasal, maxTs)
     }
 }
