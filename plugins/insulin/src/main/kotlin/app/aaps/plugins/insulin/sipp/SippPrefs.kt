@@ -32,6 +32,9 @@ object SippPrefs {
     private const val K_SITE_AGE_ENABLED = "SIPP_site_age_enabled"
     private const val K_SITE_AGE_H = "SIPP_site_age_h"         // string hours
 
+    // NEW: insulin archetype for SIPP seeding ("AUTO" | "RAPID" | "FIASP" | "LYUMJEV")
+    private const val K_INSULIN_ARCHETYPE = "SIPP_insulin_archetype"
+
     // Persisted live PK/PD state (for continuity across APK updates)
     private const val K_STATE_DIA_H = "SIPP_state_dia_h"
     private const val K_STATE_TPEAK_MIN = "SIPP_state_tpeak_min"
@@ -92,6 +95,10 @@ object SippPrefs {
     fun siteAgeH(): String = getString(K_SITE_AGE_H, "1")
     fun setSiteAgeH(v: String) = setString(K_SITE_AGE_H, v)
 
+    // --- insulin archetype for seeding (AUTO default) ---
+    fun insulinArchetype(): String = getString(K_INSULIN_ARCHETYPE, "AUTO")
+    fun setInsulinArchetype(v: String) = setString(K_INSULIN_ARCHETYPE, v)
+
     // --- live PK state get/set ---
     data class SavedState(
         val diaH: Float,
@@ -123,7 +130,12 @@ object SippPrefs {
 
     // --- ISF persistence ---
     /** ISF the algorithm actually used for dosing (mg/dL per U), with UI context at save-time. */
-    fun saveLastInstantIsfMgdl(isfMgdl: Double, tsMs: Long, bgMgdl: Double? = null, targetLowMgdl: Double? = null) {
+    fun saveLastInstantIsfMgdl(
+        isfMgdl: Double,
+        tsMs: Long,
+        bgMgdl: Double? = null,
+        targetLowMgdl: Double? = null
+    ) {
         sp?.edit {
             putFloat(K_LAST_ISF_USED_MGDL, isfMgdl.toFloat())
             putLong(K_LAST_ISF_USED_TS, tsMs)
@@ -146,8 +158,11 @@ object SippPrefs {
 
     fun lastIsfContext(): Pair<Double?, Double?> {
         val p = sp ?: return Pair(null, null)
-        val bg = if (p.contains(K_LAST_ISF_BG_MGDL)) p.getFloat(K_LAST_ISF_BG_MGDL, 0f).toDouble() else null
-        val low = if (p.contains(K_LAST_ISF_TARGETLOW_MGDL)) p.getFloat(K_LAST_ISF_TARGETLOW_MGDL, 0f).toDouble() else null
+        val bg =
+            if (p.contains(K_LAST_ISF_BG_MGDL)) p.getFloat(K_LAST_ISF_BG_MGDL, 0f).toDouble() else null
+        val low =
+            if (p.contains(K_LAST_ISF_TARGETLOW_MGDL)) p.getFloat(K_LAST_ISF_TARGETLOW_MGDL, 0f)
+                .toDouble() else null
         return Pair(bg, low)
     }
 
@@ -222,6 +237,7 @@ object SippPrefs {
             put("siteLocation", siteLocation())
             put("siteAgeEnabled", siteAgeEnabled())
             put("siteAgeH", siteAgeH())
+            put("insulinArchetype", insulinArchetype())
 
             loadState()?.let {
                 put("state_diaH", it.diaH.toDouble())
@@ -255,6 +271,7 @@ object SippPrefs {
         setSiteLocation(obj.optString("siteLocation", siteLocation()))
         setSiteAgeEnabled(obj.optBoolean("siteAgeEnabled", siteAgeEnabled()))
         setSiteAgeH(obj.optString("siteAgeH", siteAgeH()))
+        setInsulinArchetype(obj.optString("insulinArchetype", insulinArchetype()))
 
         val dia = obj.optDouble("state_diaH", Double.NaN)
         val tp = obj.optInt("state_tPeakMin", Int.MIN_VALUE)

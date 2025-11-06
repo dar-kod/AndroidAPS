@@ -75,12 +75,12 @@ import app.aaps.plugins.aps.events.EventResetOpenAPSGui
 import app.aaps.plugins.insulin.sipp.SentinelPkPdController
 import app.aaps.plugins.insulin.sipp.SippPrefs
 import org.json.JSONObject
+import java.util.Locale
 import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
 import kotlin.math.floor
 import kotlin.math.max
-import kotlin.math.min
 
 @Singleton
 open class OpenAPSSMBPlugin @Inject constructor(
@@ -168,7 +168,11 @@ open class OpenAPSSMBPlugin @Inject constructor(
             )
         else
             uiInteraction.dismissNotification(Notification.DYN_ISF_FALLBACK)
-        profiler.log(LTag.APS, "getIsfMgdl() multiplier=$multiplier reason=${sensitivity.first} sensitivity=${sensitivity.second} caller=$caller", start)
+        profiler.log(
+            LTag.APS,
+            "getIsfMgdl() multiplier=$multiplier reason=${sensitivity.first} sensitivity=${sensitivity.second} caller=$caller",
+            start
+        )
         return sensitivity.second
     }
 
@@ -183,7 +187,10 @@ open class OpenAPSSMBPlugin @Inject constructor(
             }
         }
         val sensitivity = if (count == 0) null else sum / count
-        aapsLogger.debug(LTag.APS, "getAverageIsfMgdl() $sensitivity from $count values ${dateUtil.dateAndTimeAndSecondsString(timestamp)} $caller")
+        aapsLogger.debug(
+            LTag.APS,
+            "getAverageIsfMgdl() $sensitivity from $count values ${dateUtil.dateAndTimeAndSecondsString(timestamp)} $caller"
+        )
         return sensitivity
     }
 
@@ -390,7 +397,13 @@ open class OpenAPSSMBPlugin @Inject constructor(
         val profile = profileAny
         val inputConstraints = ConstraintObject(0.0, aapsLogger)
 
-        if (!hardLimits.checkHardLimits(profile.dia, app.aaps.core.ui.R.string.profile_dia, hardLimits.minDia(), hardLimits.maxDia())) return
+        if (!hardLimits.checkHardLimits(
+                profile.dia,
+                app.aaps.core.ui.R.string.profile_dia,
+                hardLimits.minDia(),
+                hardLimits.maxDia()
+            )
+        ) return
         if (!hardLimits.checkHardLimits(
                 profile.getIcTimeFromMidnight(MidnightUtils.secondsFromMidnight()),
                 app.aaps.core.ui.R.string.profile_carbs_ratio_value,
@@ -398,9 +411,27 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 hardLimits.maxIC()
             )
         ) return
-        if (!hardLimits.checkHardLimits(profile.getIsfMgdl("OpenAPSSMBPlugin"), app.aaps.core.ui.R.string.profile_sensitivity_value, HardLimits.MIN_ISF, HardLimits.MAX_ISF)) return
-        if (!hardLimits.checkHardLimits(profile.getMaxDailyBasal(), app.aaps.core.ui.R.string.profile_max_daily_basal_value, 0.02, hardLimits.maxBasal())) return
-        if (!hardLimits.checkHardLimits(pump.baseBasalRate, app.aaps.core.ui.R.string.current_basal_value, 0.01, hardLimits.maxBasal())) return
+        if (!hardLimits.checkHardLimits(
+                profile.getIsfMgdl("OpenAPSSMBPlugin"),
+                app.aaps.core.ui.R.string.profile_sensitivity_value,
+                HardLimits.MIN_ISF,
+                HardLimits.MAX_ISF
+            )
+        ) return
+        if (!hardLimits.checkHardLimits(
+                profile.getMaxDailyBasal(),
+                app.aaps.core.ui.R.string.profile_max_daily_basal_value,
+                0.02,
+                hardLimits.maxBasal()
+            )
+        ) return
+        if (!hardLimits.checkHardLimits(
+                pump.baseBasalRate,
+                app.aaps.core.ui.R.string.current_basal_value,
+                0.01,
+                hardLimits.maxBasal()
+            )
+        ) return
 
         val dynIsfMode =
             preferences.get(BooleanKey.ApsUseDynamicSensitivity) && hardLimits.checkHardLimits(
@@ -421,15 +452,45 @@ open class OpenAPSSMBPlugin @Inject constructor(
             minutesrunning = tb?.getPassedDurationToTimeInMinutes(now)
         )
 
-        var minBg = hardLimits.verifyHardLimits(Round.roundTo(profile.getTargetLowMgdl(), 0.1), app.aaps.core.ui.R.string.profile_low_target, HardLimits.LIMIT_MIN_BG[0], HardLimits.LIMIT_MIN_BG[1])
-        var maxBg = hardLimits.verifyHardLimits(Round.roundTo(profile.getTargetHighMgdl(), 0.1), app.aaps.core.ui.R.string.profile_high_target, HardLimits.LIMIT_MAX_BG[0], HardLimits.LIMIT_MAX_BG[1])
-        var targetBg = hardLimits.verifyHardLimits(profile.getTargetMgdl(), app.aaps.core.ui.R.string.temp_target_value, HardLimits.LIMIT_TARGET_BG[0], HardLimits.LIMIT_TARGET_BG[1])
+        var minBg = hardLimits.verifyHardLimits(
+            Round.roundTo(profile.getTargetLowMgdl(), 0.1),
+            app.aaps.core.ui.R.string.profile_low_target,
+            HardLimits.LIMIT_MIN_BG[0],
+            HardLimits.LIMIT_MIN_BG[1]
+        )
+        var maxBg = hardLimits.verifyHardLimits(
+            Round.roundTo(profile.getTargetHighMgdl(), 0.1),
+            app.aaps.core.ui.R.string.profile_high_target,
+            HardLimits.LIMIT_MAX_BG[0],
+            HardLimits.LIMIT_MAX_BG[1]
+        )
+        var targetBg = hardLimits.verifyHardLimits(
+            profile.getTargetMgdl(),
+            app.aaps.core.ui.R.string.temp_target_value,
+            HardLimits.LIMIT_TARGET_BG[0],
+            HardLimits.LIMIT_TARGET_BG[1]
+        )
         var isTempTarget = false
         persistenceLayer.getTemporaryTargetActiveAt(dateUtil.now())?.let { tempTarget ->
             isTempTarget = true
-            minBg = hardLimits.verifyHardLimits(tempTarget.lowTarget, app.aaps.core.ui.R.string.temp_target_low_target, HardLimits.LIMIT_TEMP_MIN_BG[0], HardLimits.LIMIT_TEMP_MIN_BG[1])
-            maxBg = hardLimits.verifyHardLimits(tempTarget.highTarget, app.aaps.core.ui.R.string.temp_target_high_target, HardLimits.LIMIT_TEMP_MAX_BG[0], HardLimits.LIMIT_TEMP_MAX_BG[1])
-            targetBg = hardLimits.verifyHardLimits(tempTarget.target(), app.aaps.core.ui.R.string.temp_target_value, HardLimits.LIMIT_TEMP_TARGET_BG[0], HardLimits.LIMIT_TEMP_TARGET_BG[1])
+            minBg = hardLimits.verifyHardLimits(
+                tempTarget.lowTarget,
+                app.aaps.core.ui.R.string.temp_target_low_target,
+                HardLimits.LIMIT_TEMP_MIN_BG[0],
+                HardLimits.LIMIT_TEMP_MIN_BG[1]
+            )
+            maxBg = hardLimits.verifyHardLimits(
+                tempTarget.highTarget,
+                app.aaps.core.ui.R.string.temp_target_high_target,
+                HardLimits.LIMIT_TEMP_MAX_BG[0],
+                HardLimits.LIMIT_TEMP_MAX_BG[1]
+            )
+            targetBg = hardLimits.verifyHardLimits(
+                tempTarget.target(),
+                app.aaps.core.ui.R.string.temp_target_value,
+                HardLimits.LIMIT_TEMP_TARGET_BG[0],
+                HardLimits.LIMIT_TEMP_TARGET_BG[1]
+            )
         }
 
         var autosensResult = AutosensResult()
@@ -447,7 +508,10 @@ open class OpenAPSSMBPlugin @Inject constructor(
             )
         } else if (dynIsfMode && dynIsfResult.tddPartsCalculated()) {
             uiInteraction.dismissNotification(Notification.SMB_FALLBACK)
-            val tddRatio = if (preferences.get(BooleanKey.ApsDynIsfAdjustSensitivity)) (dynIsfResult.tddLast24H!! / dynIsfResult.tdd7D!!.coerceAtLeast(0.1)) else 1.0
+            val tddRatio =
+                if (preferences.get(BooleanKey.ApsDynIsfAdjustSensitivity)) (dynIsfResult.tddLast24H!! / dynIsfResult.tdd7D!!.coerceAtLeast(
+                    0.1
+                )) else 1.0
             val carbsRatio =
                 if (preferences.get(BooleanKey.ApsDynIsfAdjustSensitivity)
                     && dynIsfResult.tddLast24HCarbs != 0.0
@@ -462,7 +526,8 @@ open class OpenAPSSMBPlugin @Inject constructor(
             )
         } else {
             if (constraintsChecker.isAutosensModeEnabled().value()) {
-                val autosensData = iobCobCalculator.getLastAutosensDataWithWaitForCalculationFinish("OpenAPSPlugin")
+                val autosensData =
+                    iobCobCalculator.getLastAutosensDataWithWaitForCalculationFinish("OpenAPSPlugin")
                 if (autosensData == null) {
                     rxBus.send(EventResetOpenAPSGui(rh.gs(R.string.openaps_no_as_data)))
                     return
@@ -472,7 +537,12 @@ open class OpenAPSSMBPlugin @Inject constructor(
         }
 
         @Suppress("KotlinConstantConditions")
-        val iobArray = iobCobCalculator.calculateIobArrayForSMB(autosensResult, SMBDefaults.exercise_mode, SMBDefaults.half_basal_exercise_target, isTempTarget)
+        val iobArray = iobCobCalculator.calculateIobArrayForSMB(
+            autosensResult,
+            SMBDefaults.exercise_mode,
+            SMBDefaults.half_basal_exercise_target,
+            isTempTarget
+        )
         val mealData = iobCobCalculator.getMealDataWithWaitingForCalculationFinish()
 
         val dsOn = preferences.get(BooleanKey.ApsUseDynamicSensitivity)
@@ -495,14 +565,18 @@ open class OpenAPSSMBPlugin @Inject constructor(
         }
 
         val last1hIns = tddCalculator.calculateDaily(-1L, 0L)?.totalAmount ?: 0.0
-        val tdd7d = tddCalculator.averageTDD(tddCalculator.calculate(7, allowMissingDays = false))?.data?.totalAmount ?: 0.0
-        val per30uThresh = (bolusSumPer30MinPerTdd * tdd7d).coerceIn(bolusSumPer30MinMin, bolusSumPer30MinMax)
+        val tdd7d =
+            tddCalculator.averageTDD(tddCalculator.calculate(7, allowMissingDays = false))?.data?.totalAmount
+                ?: 0.0
+        val per30uThresh =
+            (bolusSumPer30MinPerTdd * tdd7d).coerceIn(bolusSumPer30MinMin, bolusSumPer30MinMax)
         if (last1hIns >= 2.0 * per30uThresh) {
             reasons += "insulinLoad1h≥${"%.2f".format(2.0 * per30uThresh)}U (was ${"%.2f".format(last1hIns)}U)"
         }
 
         val scheduledBasal = profile.getBasal()
-        val deliveredBasalNow = tb?.convertedToAbsolute(now, profile) ?: activePlugin.activePump.baseBasalRate
+        val deliveredBasalNow =
+            tb?.convertedToAbsolute(now, profile) ?: activePlugin.activePump.baseBasalRate
         val minutesRunning = tb?.getPassedDurationToTimeInMinutes(now) ?: 0
 
         if (deliveredBasalNow >= basalExcessRatio * scheduledBasal) {
@@ -531,12 +605,20 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 val bgPred = bgNow + 15.0 * deltaPerMin
                 val iobU = 0.0
                 val basalSuspendedMin = if (deliveredBasalNow == 0.0) minutesRunning else 0
-                val siteAgeHours = if (SippPrefs.siteAgeEnabled()) SippPrefs.siteAgeH().toDoubleOrNull() ?: 1.0 else 1.0
+                val siteAgeHours =
+                    if (SippPrefs.siteAgeEnabled()) SippPrefs.siteAgeH().toDoubleOrNull() ?: 1.0 else 1.0
                 val hrBpm: Int? = null
                 val inExercise: Boolean? = null
                 val sensorOk = true
-                val baseDiaH = profile.dia.toFloat()
-                val basePeakMin = preferences.get(IntKey.InsulinOrefPeak)
+
+                // Base DIA/Peak for SIPP seeding, optionally overridden by SIPP insulin archetype.
+                // AUTO = use current profile + InsulinOrefPeak preference.
+                val (baseDiaH, basePeakMin) = when (SippPrefs.insulinArchetype()) {
+                    "RAPID"   -> 5.0f to 75   // Humalog / NovoRapid style
+                    "FIASP"   -> 4.0f to 60   // Fiasp-style: earlier peak
+                    "LYUMJEV" -> 3.5f to 50 // Lyumjev-style: even earlier peak
+                    else      -> profile.dia.toFloat() to preferences.get(IntKey.InsulinOrefPeak)
+                }
 
                 sentinelController.applyEvidence(
                     nowMs = nowMs,
@@ -561,8 +643,8 @@ open class OpenAPSSMBPlugin @Inject constructor(
 
         val sensForJs: Double = when {
             SippPrefs.enableIsf() && instantIsfMgdl != null && instantIsfMgdl > 0.0 -> instantIsfMgdl
-            dsOn && instantIsfMgdl != null && instantIsfMgdl > 0.0                  -> instantIsfMgdl
-            else                                                                    -> baseIsfMgdl
+            dsOn && instantIsfMgdl != null && instantIsfMgdl > 0.0 -> instantIsfMgdl
+            else                                                   -> baseIsfMgdl
         }
 
         // Persist ISF readouts (used and raw)
@@ -587,8 +669,8 @@ open class OpenAPSSMBPlugin @Inject constructor(
                     unit,
                     when {
                         SippPrefs.enableIsf() && instantIsfMgdl != null -> "SIPP"
-                        dsOn && instantIsfMgdl != null                  -> "DS"
-                        else                                            -> "Profile"
+                        dsOn && instantIsfMgdl != null -> "DS"
+                        else                           -> "Profile"
                     }
                 )
             )
@@ -656,7 +738,10 @@ open class OpenAPSSMBPlugin @Inject constructor(
             TDD = calculateVariableIsf(now, epsMultiplier).second?.let { 1800.0 / it } ?: (dynIsfResult.tdd ?: 0.0)
         )
 
-        val microBolusAllowed = constraintsChecker.isSMBModeEnabled(ConstraintObject(tempBasalFallback.not(), aapsLogger)).also { inputConstraints.copyReasons(it) }.value()
+        val microBolusAllowed =
+            constraintsChecker.isSMBModeEnabled(ConstraintObject(tempBasalFallback.not(), aapsLogger)).also {
+                inputConstraints.copyReasons(it)
+            }.value()
         val flatBGsDetected = bgQualityCheck.state == BgQualityCheck.State.FLAT
 
         aapsLogger.debug(LTag.APS, ">>> Invoking determine_basal SMB <<<")
@@ -710,65 +795,66 @@ open class OpenAPSSMBPlugin @Inject constructor(
     override fun applyMaxIOBConstraints(maxIob: Constraint<Double>): Constraint<Double> {
         if (isEnabled()) {
             val maxIobPref = preferences.get(DoubleKey.ApsSmbMaxIob)
-            maxIob.setIfSmaller(maxIobPref, rh.gs(R.string.limiting_iob, maxIobPref, rh.gs(R.string.maxvalueinpreferences)), this)
-            maxIob.setIfSmaller(hardLimits.maxIobSMB(), rh.gs(R.string.limiting_iob, hardLimits.maxIobSMB(), rh.gs(R.string.hardlimit)), this)
+            maxIob.setIfSmaller(
+                maxIobPref,
+                rh.gs(R.string.limiting_iob, maxIobPref, rh.gs(R.string.maxvalueinpreferences)),
+                this
+            )
+            maxIob.setIfSmaller(
+                hardLimits.maxIobSMB(),
+                rh.gs(R.string.limiting_iob, hardLimits.maxIobSMB(), rh.gs(R.string.hardlimit)),
+                this
+            )
         }
         return maxIob
     }
 
     override fun applyBasalConstraints(absoluteRate: Constraint<Double>, profile: Profile): Constraint<Double> {
         if (isEnabled()) {
+            var maxBasal = preferences.get(DoubleKey.ApsMaxBasal)
+            if (maxBasal < profile.getMaxDailyBasal()) {
+                maxBasal = profile.getMaxDailyBasal()
+                absoluteRate.addReason(rh.gs(R.string.increasing_max_basal), this)
+            }
+            absoluteRate.setIfSmaller(
+                maxBasal,
+                rh.gs(
+                    app.aaps.core.ui.R.string.limitingbasalratio,
+                    maxBasal,
+                    rh.gs(R.string.maxvalueinpreferences)
+                ),
+                this
+            )
+
+            val maxBasalMultiplier = preferences.get(DoubleKey.ApsMaxCurrentBasalMultiplier)
+            val maxFromBasalMultiplier = floor(maxBasalMultiplier * profile.getBasal() * 100) / 100
+            absoluteRate.setIfSmaller(
+                maxFromBasalMultiplier,
+                rh.gs(
+                    app.aaps.core.ui.R.string.limitingbasalratio,
+                    maxFromBasalMultiplier,
+                    rh.gs(R.string.max_basal_multiplier)
+                ),
+                this
+            )
+            val maxBasalFromDaily = preferences.get(DoubleKey.ApsMaxDailyMultiplier)
+            val maxFromDaily = floor(profile.getMaxDailyBasal() * maxBasalFromDaily * 100) / 100
+            absoluteRate.setIfSmaller(
+                maxFromDaily,
+                rh.gs(
+                    app.aaps.core.ui.R.string.limitingbasalratio,
+                    maxFromDaily,
+                    rh.gs(R.string.max_daily_basal_multiplier)
+                ),
+                this
+            )
+
+            // NEW: apply SIPP Max Basal if enabled and available
             val sippMaxBasal = if (SippPrefs.enableMaxBasal()) SippPrefs.lastMaxBasalUph() else null
             if (sippMaxBasal != null && sippMaxBasal > 0.0) {
-                // SIPP Max Basal path: we treat SIPP suggestion as primary cap,
-                // but still honor multipliers + daily safety and hard limits.
-                var maxBasal = sippMaxBasal.coerceAtMost(hardLimits.maxBasal())
-
-                val maxBasalMultiplier = preferences.get(DoubleKey.ApsMaxCurrentBasalMultiplier)
-                val maxFromBasalMultiplier = floor(maxBasalMultiplier * profile.getBasal() * 100) / 100
-                if (maxFromBasalMultiplier > 0.0) {
-                    maxBasal = min(maxBasal, maxFromBasalMultiplier)
-                }
-
-                val maxBasalFromDaily = preferences.get(DoubleKey.ApsMaxDailyMultiplier)
-                val maxFromDaily = floor(profile.getMaxDailyBasal() * maxBasalFromDaily * 100) / 100
-                if (maxFromDaily > 0.0) {
-                    maxBasal = min(maxBasal, maxFromDaily)
-                }
-
-                absoluteRate.setIfSmaller(
-                    maxBasal,
-                    rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxBasal, "SIPP max basal"),
-                    this
-                )
-            } else {
-                // Original behavior (no SIPP override / no value yet)
-                var maxBasal = preferences.get(DoubleKey.ApsMaxBasal)
-                if (maxBasal < profile.getMaxDailyBasal()) {
-                    maxBasal = profile.getMaxDailyBasal()
-                    absoluteRate.addReason(rh.gs(R.string.increasing_max_basal), this)
-                }
-                absoluteRate.setIfSmaller(
-                    maxBasal,
-                    rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxBasal, rh.gs(R.string.maxvalueinpreferences)),
-                    this
-                )
-
-                val maxBasalMultiplier = preferences.get(DoubleKey.ApsMaxCurrentBasalMultiplier)
-                val maxFromBasalMultiplier = floor(maxBasalMultiplier * profile.getBasal() * 100) / 100
-                absoluteRate.setIfSmaller(
-                    maxFromBasalMultiplier,
-                    rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxFromBasalMultiplier, rh.gs(R.string.max_basal_multiplier)),
-                    this
-                )
-
-                val maxBasalFromDaily = preferences.get(DoubleKey.ApsMaxDailyMultiplier)
-                val maxFromDaily = floor(profile.getMaxDailyBasal() * maxBasalFromDaily * 100) / 100
-                absoluteRate.setIfSmaller(
-                    maxFromDaily,
-                    rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxFromDaily, rh.gs(R.string.max_daily_basal_multiplier)),
-                    this
-                )
+                val msg = "Limiting basal by SIPP Max Basal (" +
+                    String.format(Locale.getDefault(), "%.2f", sippMaxBasal) + " U/h)"
+                absoluteRate.setIfSmaller(sippMaxBasal, msg, this)
             }
         }
         return absoluteRate
@@ -808,7 +894,12 @@ open class OpenAPSSMBPlugin @Inject constructor(
             .store(IntKey.ApsDynIsfAdjustmentFactor, preferences)
     }
 
-    override fun addPreferenceScreen(preferenceManager: PreferenceManager, parent: PreferenceScreen, context: Context, requiredKey: String?) {
+    override fun addPreferenceScreen(
+        preferenceManager: PreferenceManager,
+        parent: PreferenceScreen,
+        context: Context,
+        requiredKey: String?
+    ) {
         if (requiredKey != null && requiredKey != "absorption_smb_advanced") return
         val category = PreferenceCategory(context)
         parent.addPreference(category)
@@ -816,8 +907,22 @@ open class OpenAPSSMBPlugin @Inject constructor(
             key = "openapssmb_settings"
             title = rh.gs(R.string.openapssmb)
             initialExpandedChildrenCount = 0
-            addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsMaxBasal, dialogMessage = R.string.openapsma_max_basal_summary, title = R.string.openapsma_max_basal_title))
-            addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsSmbMaxIob, dialogMessage = R.string.openapssmb_max_iob_summary, title = R.string.openapssmb_max_iob_title))
+            addPreference(
+                AdaptiveDoublePreference(
+                    ctx = context,
+                    doubleKey = DoubleKey.ApsMaxBasal,
+                    dialogMessage = R.string.openapsma_max_basal_summary,
+                    title = R.string.openapsma_max_basal_title
+                )
+            )
+            addPreference(
+                AdaptiveDoublePreference(
+                    ctx = context,
+                    doubleKey = DoubleKey.ApsSmbMaxIob,
+                    dialogMessage = R.string.openapssmb_max_iob_summary,
+                    title = R.string.openapssmb_max_iob_title
+                )
+            )
             addPreference(
                 AdaptiveSwitchPreference(
                     ctx = context,
@@ -832,23 +937,139 @@ open class OpenAPSSMBPlugin @Inject constructor(
                     }
                 }
             )
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsUseAutosens, title = R.string.openapsama_use_autosens))
-            addPreference(AdaptiveIntPreference(ctx = context, intKey = IntKey.ApsDynIsfAdjustmentFactor, dialogMessage = R.string.dyn_isf_adjust_summary, title = R.string.dyn_isf_adjust_title))
-            addPreference(AdaptiveUnitPreference(ctx = context, unitKey = UnitDoubleKey.ApsLgsThreshold, dialogMessage = R.string.lgs_threshold_summary, title = R.string.lgs_threshold_title))
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsDynIsfAdjustSensitivity, summary = R.string.dynisf_adjust_sensitivity_summary, title = R.string.dynisf_adjust_sensitivity))
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsSensitivityRaisesTarget, summary = R.string.sensitivity_raises_target_summary, title = R.string.sensitivity_raises_target_title))
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsResistanceLowersTarget, summary = R.string.resistance_lowers_target_summary, title = R.string.resistance_lowers_target_title))
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsUseSmb, summary = R.string.enable_smb_summary, title = R.string.enable_smb))
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsUseSmbWithHighTt, summary = R.string.enable_smb_with_high_temp_target_summary, title = R.string.enable_smb_with_high_temp_target))
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsUseSmbAlways, summary = R.string.enable_smb_always_summary, title = R.string.enable_smb_always))
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsUseSmbWithCob, summary = R.string.enable_smb_with_cob_summary, title = R.string.enable_smb_with_cob))
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsUseSmbWithLowTt, summary = R.string.enable_smb_with_temp_target_summary, title = R.string.enable_smb_with_temp_target))
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsUseSmbAfterCarbs, summary = R.string.enable_smb_after_carbs_summary, title = R.string.enable_smb_after_carbs))
-            addPreference(AdaptiveIntPreference(ctx = context, intKey = IntKey.ApsMaxSmbFrequency, title = R.string.smb_interval_summary))
-            addPreference(AdaptiveIntPreference(ctx = context, intKey = IntKey.ApsMaxMinutesOfBasalToLimitSmb, title = R.string.smb_max_minutes_summary))
-            addPreference(AdaptiveIntPreference(ctx = context, intKey = IntKey.ApsUamMaxMinutesOfBasalToLimitSmb, dialogMessage = R.string.uam_smb_max_minutes, title = R.string.uam_smb_max_minutes_summary))
-            addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsUseUam, summary = R.string.enable_uam_summary, title = R.string.enable_uam))
-            addPreference(AdaptiveIntPreference(ctx = context, intKey = IntKey.ApsCarbsRequestThreshold, dialogMessage = R.string.carbs_req_threshold_summary, title = R.string.carbs_req_threshold))
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseAutosens,
+                    title = R.string.openapsama_use_autosens
+                )
+            )
+            addPreference(
+                AdaptiveIntPreference(
+                    ctx = context,
+                    intKey = IntKey.ApsDynIsfAdjustmentFactor,
+                    dialogMessage = R.string.dyn_isf_adjust_summary,
+                    title = R.string.dyn_isf_adjust_title
+                )
+            )
+            addPreference(
+                AdaptiveUnitPreference(
+                    ctx = context,
+                    unitKey = UnitDoubleKey.ApsLgsThreshold,
+                    dialogMessage = R.string.lgs_threshold_summary,
+                    title = R.string.lgs_threshold_title
+                )
+            )
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsDynIsfAdjustSensitivity,
+                    summary = R.string.dynisf_adjust_sensitivity_summary,
+                    title = R.string.dynisf_adjust_sensitivity
+                )
+            )
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsSensitivityRaisesTarget,
+                    summary = R.string.sensitivity_raises_target_summary,
+                    title = R.string.sensitivity_raises_target_title
+                )
+            )
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsResistanceLowersTarget,
+                    summary = R.string.resistance_lowers_target_summary,
+                    title = R.string.resistance_lowers_target_title
+                )
+            )
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmb,
+                    summary = R.string.enable_smb_summary,
+                    title = R.string.enable_smb
+                )
+            )
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmbWithHighTt,
+                    summary = R.string.enable_smb_with_high_temp_target_summary,
+                    title = R.string.enable_smb_with_high_temp_target
+                )
+            )
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmbAlways,
+                    summary = R.string.enable_smb_always_summary,
+                    title = R.string.enable_smb_always
+                )
+            )
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmbWithCob,
+                    summary = R.string.enable_smb_with_cob_summary,
+                    title = R.string.enable_smb_with_cob
+                )
+            )
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmbWithLowTt,
+                    summary = R.string.enable_smb_with_temp_target_summary,
+                    title = R.string.enable_smb_with_temp_target
+                )
+            )
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmbAfterCarbs,
+                    summary = R.string.enable_smb_after_carbs_summary,
+                    title = R.string.enable_smb_after_carbs
+                )
+            )
+            addPreference(
+                AdaptiveIntPreference(
+                    ctx = context,
+                    intKey = IntKey.ApsMaxSmbFrequency,
+                    title = R.string.smb_interval_summary
+                )
+            )
+            addPreference(
+                AdaptiveIntPreference(
+                    ctx = context,
+                    intKey = IntKey.ApsMaxMinutesOfBasalToLimitSmb,
+                    title = R.string.smb_max_minutes_summary
+                )
+            )
+            addPreference(
+                AdaptiveIntPreference(
+                    ctx = context,
+                    intKey = IntKey.ApsUamMaxMinutesOfBasalToLimitSmb,
+                    dialogMessage = R.string.uam_smb_max_minutes,
+                    title = R.string.uam_smb_max_minutes_summary
+                )
+            )
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseUam,
+                    summary = R.string.enable_uam_summary,
+                    title = R.string.enable_uam
+                )
+            )
+            addPreference(
+                AdaptiveIntPreference(
+                    ctx = context,
+                    intKey = IntKey.ApsCarbsRequestThreshold,
+                    dialogMessage = R.string.carbs_req_threshold_summary,
+                    title = R.string.carbs_req_threshold
+                )
+            )
             addPreference(preferenceManager.createPreferenceScreen(context).apply {
                 key = "absorption_smb_advanced"
                 title = rh.gs(app.aaps.core.ui.R.string.advanced_settings_title)
@@ -856,14 +1077,36 @@ open class OpenAPSSMBPlugin @Inject constructor(
                     AdaptiveIntentPreference(
                         ctx = context,
                         intentKey = IntentKey.ApsLinkToDocs,
-                        intent = Intent().apply { action = Intent.ACTION_VIEW; data = rh.gs(R.string.openapsama_link_to_preference_json_doc).toUri() },
+                        intent = Intent().apply {
+                            action = Intent.ACTION_VIEW
+                            data = rh.gs(R.string.openapsama_link_to_preference_json_doc).toUri()
+                        },
                         summary = R.string.openapsama_link_to_preference_json_doc_txt
                     )
                 )
-                addPreference(AdaptiveSwitchPreference(ctx = context, booleanKey = BooleanKey.ApsAlwaysUseShortDeltas, summary = R.string.always_use_short_avg_summary, title = R.string.always_use_short_avg))
-                addPreference(AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsMaxDailyMultiplier, dialogMessage = R.string.openapsama_max_daily_safety_multiplier_summary, title = R.string.openapsama_max_daily_safety_multiplier))
                 addPreference(
-                    AdaptiveDoublePreference(ctx = context, doubleKey = DoubleKey.ApsMaxCurrentBasalMultiplier, dialogMessage = R.string.openapsama_current_basal_safety_multiplier_summary, title = R.string.openapsama_current_basal_safety_multiplier)
+                    AdaptiveSwitchPreference(
+                        ctx = context,
+                        booleanKey = BooleanKey.ApsAlwaysUseShortDeltas,
+                        summary = R.string.always_use_short_avg_summary,
+                        title = R.string.always_use_short_avg
+                    )
+                )
+                addPreference(
+                    AdaptiveDoublePreference(
+                        ctx = context,
+                        doubleKey = DoubleKey.ApsMaxDailyMultiplier,
+                        dialogMessage = R.string.openapsama_max_daily_safety_multiplier_summary,
+                        title = R.string.openapsama_max_daily_safety_multiplier
+                    )
+                )
+                addPreference(
+                    AdaptiveDoublePreference(
+                        ctx = context,
+                        doubleKey = DoubleKey.ApsMaxCurrentBasalMultiplier,
+                        dialogMessage = R.string.openapsama_current_basal_safety_multiplier_summary,
+                        title = R.string.openapsama_current_basal_safety_multiplier
+                    )
                 )
             })
         }
