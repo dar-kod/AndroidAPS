@@ -92,6 +92,31 @@ class SentinelPkPdController @Inject constructor() {
 
         // Residual = actual - predicted (negative => insulin stronger than model)
         val residual = (bgNow - bgPred).toFloat()
+        val absResidual = abs(residual)
+
+        // --- Spike rejection: ignore single noisy ticks for learning ---
+        val steepSlope = abs(deltaPerMin).toFloat() > SPIKE_SLOPE_TH     // fast BG move
+        val bigJump = absResidual > SPIKE_RESIDUAL_TH                    // large residual
+        val recentlyUpdated = lastResidualTs != 0L &&
+            (nowMs - lastResidualTs) <= SPIKE_WINDOW_MIN * 60_000L
+        val signFlip = lastResidual * residual < 0f                      // changed sign vs last tick
+
+        // Example spike: steep slope + (big jump OR fast sign flip shortly after prev sample)
+        val isSpike = steepSlope && (bigJump || (recentlyUpdated && signFlip))
+
+        if (isSpike) {
+            // We still keep telemetry for diagnostics, but do NOT adapt PK on this tick.
+            pushTelem(residual)
+            quietMin = 0f
+            // Drift very gently toward profile peak; do not touch DIA floors/rails here.
+            decayToward(baseDiaH, basePeakMin, 1.0f, dtMin)
+            lastResidual = residual
+            lastResidualTs = nowMs
+            persist(nowMs)
+            return
+        }
+
+        // Normal telemetry path
         pushTelem(residual)
 
         // Situational sentinels
@@ -101,11 +126,19 @@ class SentinelPkPdController @Inject constructor() {
         val prolongedSuspend = basalSuspendedMin >= 20
         val negIob = iobU < 0.0
 
+        // Late-low penalty: lows in the late tail are strong evidence for longer DIA.
+        val bolusAgeMin = minutesSinceLastBolus.toFloat()
+        val diaTailStartMin = baseDiaH * 60f * LATE_TAIL_START_FRAC
+        val diaTailEndMin = baseDiaH * 60f * LATE_TAIL_END_FRAC
+        val inLateTail = bolusAgeMin in diaTailStartMin..diaTailEndMin
+        val lateLow = inLateTail && residual < -RESIDUAL_TH_STRONG
+
         val slowSiteScore =
             (if (earlySite) 1 else 0) +
                 (if (stack) 1 else 0) +
                 (if (falling && (negIob || prolongedSuspend)) 1 else 0) +
-                (if (biasStrong()) 1 else 0)
+                (if (biasStrong()) 1 else 0) +
+                (if (lateLow) 1 else 0)
         val slowSiteActive = slowSiteScore >= 2
 
         // Activity → later peak & slightly weaker ISF
@@ -126,23 +159,32 @@ class SentinelPkPdController @Inject constructor() {
 
         if (strongInsulin) {
             // insulin stronger → lengthen horizon, later peak, weaker ISF
-            diaH += DIA_STEP_UP
-            tPeakMin += TPEAK_STEP_MIN
-            isfMult += ISF_STEP_WEAKEN
+            var stepScale = computeStepScale(absResidual)
+            // Late-low = very strong signal: ensure a minimum upward step
+            if (lateLow) stepScale = max(stepScale, LATE_LOW_MIN_STEP_SCALE)
+
+            diaH += DIA_STEP_UP * stepScale
+            val peakStep = max(1, (TPEAK_STEP_MIN * stepScale).toInt())
+            tPeakMin += peakStep
+            isfMult += ISF_STEP_WEAKEN * stepScale
             quietMin = 0f
             lockoutMin = STRONG_LOCKOUT_MIN
         } else if (weakInsulin) {
             // insulin weaker → DO NOT shorten DIA; adjust ISF/peak gently
-            isfMult -= ISF_STEP_STRENGTHEN
-            tPeakMin -= TPEAK_STEP_MIN
+            val stepScale = computeStepScale(absResidual)
+            val peakStep = max(1, (TPEAK_STEP_MIN * stepScale).toInt())
+            isfMult -= ISF_STEP_STRENGTHEN * stepScale
+            tPeakMin -= peakStep
             quietMin += dtMin
         } else {
             // quiet → slow decay toward profile & activity targets
-            quietMin += if (!falling && !negIob && !prolongedSuspend) dtMin else 0f
+            if (!falling && !negIob && !prolongedSuspend) {
+                quietMin += dtMin
+            }
             decayToward(baseDiaH, targetPeakMin, targetIsfMult, dtMin)
         }
 
-        // Floors & rails (slow-site floors)
+        // Floors & rails (slow-site + late-low floors)
         val diaCeil = if (SippPrefs.allowDiaAbove9h()) DIA_MAX else 12.0f
         val floor = when {
             slowSiteActive && falling -> max(DIA_FLOOR_HARD, baseDiaH)
@@ -154,6 +196,9 @@ class SentinelPkPdController @Inject constructor() {
         tPeakMin = tPeakMin.coerceIn(TPEAK_MIN_MIN, TPEAK_MAX_MIN)
         isfMult = isfMult.coerceIn(ISF_MIN, ISF_MAX)
 
+        lastResidual = residual
+        lastResidualTs = nowMs
+
         persist(nowMs)
     }
 
@@ -162,10 +207,11 @@ class SentinelPkPdController @Inject constructor() {
     companion object {
 
         // --- Relaxation gate (allows DIA to come down safely) ---
-        private const val RELAX_UNLOCK_CONF: Float = 0.65f   // confidence ≥ this to allow shortening
-        private const val RELAX_AFTER_MIN: Float = 45f     // need this many quiet minutes before relaxing
-        private const val RELAX_RATE_PER_H: Float = 0.05f   // max downward relaxation per hour (soft)
-        private const val STRONG_LOCKOUT_MIN: Float = 30f     // after strong insulin, block relaxing for X min
+        // Stricter than before: needs higher confidence + longer quiet time, and moves down more slowly.
+        private const val RELAX_UNLOCK_CONF: Float = 0.75f   // confidence ≥ this to allow shortening
+        private const val RELAX_AFTER_MIN: Float = 60f      // need this many quiet minutes before relaxing
+        private const val RELAX_RATE_PER_H: Float = 0.03f   // max downward relaxation per hour (soft)
+        private const val STRONG_LOCKOUT_MIN: Float = 45f   // after strong insulin, block relaxing for X min
 
         // Rails
         private const val DIA_MIN: Float = 4.5f
@@ -189,6 +235,17 @@ class SentinelPkPdController @Inject constructor() {
         // Residual telemetry
         private const val RESIDUAL_TH_STRONG: Float = 6.0f
         private const val CUSUM_DECAY: Float = 0.85f
+
+        // Spike rejection
+        // Considered spike if slope is steep AND (residual very large OR fast sign flip in short window).
+        private const val SPIKE_SLOPE_TH: Float = 3.0f        // mg/dL per minute (≈15 mg/dL over 5 min)
+        private const val SPIKE_RESIDUAL_TH: Float = 20.0f    // mg/dL residual
+        private const val SPIKE_WINDOW_MIN: Long = 15L        // min window for sign-flip spike detection
+
+        // Late-low handling (tail of DIA)
+        private const val LATE_TAIL_START_FRAC: Float = 0.6f  // start of "late tail" as fraction of DIA
+        private const val LATE_TAIL_END_FRAC: Float = 1.5f    // end of window (allow some over-DIA events)
+        private const val LATE_LOW_MIN_STEP_SCALE: Float = 0.7f // minimum upward step scaling when late-low
     }
 
     // State (timers & dynamics)
@@ -207,6 +264,10 @@ class SentinelPkPdController @Inject constructor() {
     private var sumResidual: Float = 0f
     private var count: Int = 0
     private var cusum: Float = 0f
+
+    // For spike detection / temporal context
+    private var lastResidual: Float = 0f
+    private var lastResidualTs: Long = 0L
 
     private fun tryRestoreOnce(): Boolean {
         if (restored) return true
@@ -249,6 +310,16 @@ class SentinelPkPdController @Inject constructor() {
         // Peak & ISF tween
         tPeakMin += ((targetPeakMin - tPeakMin).toFloat() * k).toInt()
         isfMult += (targetIsfMult - isfMult) * k
+    }
+
+    /**
+     * ABS-weighted step scaling:
+     * - Just above threshold → small step (0.3x)
+     * - Larger residuals → up to full step (1.0x)
+     */
+    private fun computeStepScale(absResidual: Float): Float {
+        val raw = absResidual / (RESIDUAL_TH_STRONG * 2f)
+        return raw.coerceIn(0.3f, 1.0f)
     }
 
     private fun pushTelem(residual: Float) {
