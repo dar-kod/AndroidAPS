@@ -79,6 +79,7 @@ import java.util.Locale
 import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
+import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.max
 
@@ -603,7 +604,10 @@ open class OpenAPSSMBPlugin @Inject constructor(
                     0.0
                 }
                 val bgPred = bgNow + 15.0 * deltaPerMin
-                val iobU = 0.0
+
+                // Real total IOB at "now" (fallback to 0 on any API mismatch)
+                val iobU = runCatching { iobArray.lastOrNull()?.iob ?: 0.0 }.getOrDefault(0.0)
+
                 val basalSuspendedMin = if (deliveredBasalNow == 0.0) minutesRunning else 0
                 val siteAgeHours =
                     if (SippPrefs.siteAgeEnabled()) SippPrefs.siteAgeH().toDoubleOrNull() ?: 1.0 else 1.0
@@ -611,12 +615,21 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 val inExercise: Boolean? = null
                 val sensorOk = true
 
+                // Optional: quick log for the “tail-low” signature (no behavior change here)
+                val tailLowCandidate =
+                    (abs(iobU) < 0.1) &&
+                        (minutesSinceLastBolus >= 90) &&
+                        (bgNow < minBg)
+                if (tailLowCandidate) {
+                    aapsLogger.debug(LTag.APS, "SIPP tail-low candidate: IOB≈0, no recent SMBs, BG<$minBg")
+                }
+
                 // Base DIA/Peak for SIPP seeding, optionally overridden by SIPP insulin archetype.
                 // AUTO = use current profile + InsulinOrefPeak preference.
                 val (baseDiaH, basePeakMin) = when (SippPrefs.insulinArchetype()) {
                     "RAPID"   -> 5.0f to 75   // Humalog / NovoRapid style
                     "FIASP"   -> 4.0f to 60   // Fiasp-style: earlier peak
-                    "LYUMJEV" -> 3.5f to 50 // Lyumjev-style: even earlier peak
+                    "LYUMJEV" -> 3.5f to 50   // Lyumjev-style: even earlier peak
                     else      -> profile.dia.toFloat() to preferences.get(IntKey.InsulinOrefPeak)
                 }
 
