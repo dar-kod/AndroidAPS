@@ -94,6 +94,9 @@ class SentinelPkPdController @Inject constructor() {
         val residual = (bgNow - bgPred).toFloat()
         val absResidual = abs(residual)
 
+        // Track bolus edge for late-tail windows
+        noteBolusAge(minutesSinceLastBolus, nowMs)
+
         // --- Spike rejection: ignore single noisy ticks for learning ---
         val steepSlope = abs(deltaPerMin).toFloat() > SPIKE_SLOPE_TH     // fast BG move
         val bigJump = absResidual > SPIKE_RESIDUAL_TH                    // large residual
@@ -105,10 +108,9 @@ class SentinelPkPdController @Inject constructor() {
         val isSpike = steepSlope && (bigJump || (recentlyUpdated && signFlip))
 
         if (isSpike) {
-            // We still keep telemetry for diagnostics, but do NOT adapt PK on this tick.
+            // Keep telemetry for diagnostics, but do NOT adapt PK on this tick.
             pushTelem(residual)
             quietMin = 0f
-            // Drift very gently toward profile peak; do not touch DIA floors/rails here.
             decayToward(baseDiaH, basePeakMin, 1.0f, dtMin)
             lastResidual = residual
             lastResidualTs = nowMs
@@ -130,8 +132,8 @@ class SentinelPkPdController @Inject constructor() {
         val bolusAgeMin = minutesSinceLastBolus.toFloat()
         val diaTailStartMin = baseDiaH * 60f * LATE_TAIL_START_FRAC
         val diaTailEndMin = baseDiaH * 60f * LATE_TAIL_END_FRAC
-        val inLateTail = bolusAgeMin in diaTailStartMin..diaTailEndMin
-        val lateLow = inLateTail && residual < -RESIDUAL_TH_STRONG
+        val inLateTailSimple = bolusAgeMin in diaTailStartMin..diaTailEndMin
+        val lateLow = inLateTailSimple && residual < -RESIDUAL_TH_STRONG
 
         val slowSiteScore =
             (if (earlySite) 1 else 0) +
@@ -168,7 +170,7 @@ class SentinelPkPdController @Inject constructor() {
             tPeakMin += peakStep
             isfMult += ISF_STEP_WEAKEN * stepScale
             quietMin = 0f
-            lockoutMin = STRONG_LOCKOUT_MIN
+            lockoutMin = max(lockoutMin, STRONG_LOCKOUT_MIN)
         } else if (weakInsulin) {
             // insulin weaker → DO NOT shorten DIA; adjust ISF/peak gently
             val stepScale = computeStepScale(absResidual)
@@ -182,6 +184,24 @@ class SentinelPkPdController @Inject constructor() {
                 quietMin += dtMin
             }
             decayToward(baseDiaH, targetPeakMin, targetIsfMult, dtMin)
+        }
+
+        // --- NEW: robust late-tail EWMA nudges (3–8 h post-bolus), spike/suspend-aware ---
+        val inLT = inLateTailWindow(nowMs)
+        updateLateTail(residual, inLT, basalSuspendedMin)
+
+        val ltReady = ltCount >= 6 // need a few samples total before acting
+        if (ltReady) {
+            if (ltMedian < -4f) {
+                // persistent negative residual late → lengthen a bit
+                diaH += 0.10f
+                quietMin = 0f
+                lockoutMin = max(lockoutMin, 15f)
+            } else if (ltMedian > -2f && calcConfidence() >= 0.60f && quietMin >= 30f && lockoutMin <= 0f) {
+                // evidence clean → permit gentle downward drift (bounded)
+                val downCap = 0.07f * (dtMin / 60f) // RELAX_RATE_PER_H
+                diaH = max(baseDiaH, diaH - downCap)
+            }
         }
 
         // Floors & rails (slow-site + late-low floors)
@@ -207,11 +227,10 @@ class SentinelPkPdController @Inject constructor() {
     companion object {
 
         // --- Relaxation gate (allows DIA to come down safely) ---
-        // Stricter than before: needs higher confidence + longer quiet time, and moves down more slowly.
-        private const val RELAX_UNLOCK_CONF: Float = 0.75f   // confidence ≥ this to allow shortening
-        private const val RELAX_AFTER_MIN: Float = 60f      // need this many quiet minutes before relaxing
-        private const val RELAX_RATE_PER_H: Float = 0.03f   // max downward relaxation per hour (soft)
-        private const val STRONG_LOCKOUT_MIN: Float = 45f   // after strong insulin, block relaxing for X min
+        private const val RELAX_UNLOCK_CONF: Float = 0.60f   // was 0.75
+        private const val RELAX_AFTER_MIN: Float = 30f       // was 60
+        private const val RELAX_RATE_PER_H: Float = 0.07f    // was 0.03
+        private const val STRONG_LOCKOUT_MIN: Float = 30f    // was 45
 
         // Rails
         private const val DIA_MIN: Float = 4.5f
@@ -237,15 +256,14 @@ class SentinelPkPdController @Inject constructor() {
         private const val CUSUM_DECAY: Float = 0.85f
 
         // Spike rejection
-        // Considered spike if slope is steep AND (residual very large OR fast sign flip in short window).
-        private const val SPIKE_SLOPE_TH: Float = 3.0f        // mg/dL per minute (≈15 mg/dL over 5 min)
+        private const val SPIKE_SLOPE_TH: Float = 3.0f        // mg/dL per min
         private const val SPIKE_RESIDUAL_TH: Float = 20.0f    // mg/dL residual
-        private const val SPIKE_WINDOW_MIN: Long = 15L        // min window for sign-flip spike detection
+        private const val SPIKE_WINDOW_MIN: Long = 15L        // min
 
         // Late-low handling (tail of DIA)
-        private const val LATE_TAIL_START_FRAC: Float = 0.6f  // start of "late tail" as fraction of DIA
-        private const val LATE_TAIL_END_FRAC: Float = 1.5f    // end of window (allow some over-DIA events)
-        private const val LATE_LOW_MIN_STEP_SCALE: Float = 0.7f // minimum upward step scaling when late-low
+        private const val LATE_TAIL_START_FRAC: Float = 0.6f
+        private const val LATE_TAIL_END_FRAC: Float = 1.5f
+        private const val LATE_LOW_MIN_STEP_SCALE: Float = 0.7f
     }
 
     // State (timers & dynamics)
@@ -268,6 +286,11 @@ class SentinelPkPdController @Inject constructor() {
     // For spike detection / temporal context
     private var lastResidual: Float = 0f
     private var lastResidualTs: Long = 0L
+
+    // --- NEW: late-tail tracker state ---
+    private var ltMedian: Float = 0f
+    private var ltCount: Int = 0
+    private var lastBolusMs: Long = 0L
 
     private fun tryRestoreOnce(): Boolean {
         if (restored) return true
@@ -297,11 +320,10 @@ class SentinelPkPdController @Inject constructor() {
         // If allowed, target is baseline; otherwise never shorter than current
         val diaTarget = if (allowRelax) baseDiaH else max(baseDiaH, diaH)
 
-        // Apply a gentle cap on per-tick downward move (battery-neutral O(1))
+        // Apply a gentle cap on per-tick downward move
         val nextDia = diaH + (diaTarget - diaH) * k
         val maxDownStep = (RELAX_RATE_PER_H * (dtMin / 60.0f))
         diaH = if (allowRelax && nextDia < diaH) {
-            // limit downward speed
             max(nextDia, diaH - maxDownStep)
         } else {
             nextDia
@@ -339,5 +361,29 @@ class SentinelPkPdController @Inject constructor() {
         val rmseScore = (1f - (rmse / 30f)).coerceIn(0f, 1f)    // 30 mg/dL soft bound
         val biasScore = (1f - (abs(b) / 15f)).coerceIn(0f, 1f)  // 15 mg/dL soft bound
         return (0.6f * rmseScore + 0.4f * biasScore)
+    }
+
+    // --- NEW: late-tail helpers ---
+    private fun inLateTailWindow(nowMs: Long): Boolean {
+        if (lastBolusMs == 0L) return false
+        val minW = 3L * 60L * 60L * 1000L   // 3 h
+        val maxW = 8L * 60L * 60L * 1000L   // 8 h
+        val dt = nowMs - lastBolusMs
+        return dt in minW..maxW
+    }
+
+    private fun noteBolusAge(minutesSinceLastBolus: Int, nowMs: Long) {
+        // Refresh anchor when a bolus is very recent (1–2 min) to avoid missing the window
+        if (minutesSinceLastBolus in 1..2) lastBolusMs = nowMs
+    }
+
+    private fun updateLateTail(residual: Float, inWindow: Boolean, basalSuspendedMin: Int) {
+        if (!inWindow) return
+        if (basalSuspendedMin > 0) return // skip windows distorted by suspend
+        // robust EWMA of clamped residuals (–10..+10 mg/dL)
+        val r = residual.coerceIn(-10f, 10f)
+        val alpha = 0.15f
+        ltMedian = (1f - alpha) * ltMedian + alpha * r
+        if (abs(r) <= 10f) ltCount = (ltCount + 1).coerceAtMost(1000)
     }
 }

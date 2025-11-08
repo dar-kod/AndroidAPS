@@ -240,8 +240,7 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
                     instBasal,
                     profBasalUph
                 )
-
-            else                                 ->
+            else ->
                 String.format(
                     Locale.getDefault(),
                     "Instant (SIPP): —   |   Profile: %.2f U/h",
@@ -259,8 +258,7 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
                     instMaxBasal,
                     prefMaxBasalUph
                 )
-
-            else                                       ->
+            else ->
                 String.format(
                     Locale.getDefault(),
                     "Instant (SIPP): —   |   Pref: %.2f U/h",
@@ -373,6 +371,26 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             isEnabled = SippPrefs.enablePk()
         }
         sippCategory.addPreference(sippDiaExpert)
+
+        // NEW: Apply SIPP Instant Basal
+        val sippBasalToggle = SwitchPreferenceCompat(context).apply {
+            key = "sipp_enable_basal"
+            title = "Apply SIPP Instant Basal"
+            summary = "Use SIPP’s calculated basal (from Instant ISF) as the current basal input."
+            isChecked = SippPrefs.enableBasal()
+            isEnabled = true
+        }
+        sippCategory.addPreference(sippBasalToggle)
+
+        // NEW: Apply SIPP Max Temp Basal cap
+        val sippMaxBasalToggle = SwitchPreferenceCompat(context).apply {
+            key = "sipp_enable_max_basal"
+            title = "Apply SIPP Max Temp Basal cap"
+            summary = "Limit temp basals to SIPP’s suggested maximum (Max U/h a Temp Basal can be set to)."
+            isChecked = SippPrefs.enableMaxBasal()
+            isEnabled = true
+        }
+        sippCategory.addPreference(sippMaxBasalToggle)
 
         // Optional site inputs
         val siteLocationPref = ListPreference(context).apply {
@@ -494,6 +512,33 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             )
             true
         }
+
+        // NEW: listeners for SIPP Basal toggles
+        sippBasalToggle.setOnPreferenceChangeListener { _, newValue ->
+            SippPrefs.setEnableBasal(newValue as Boolean)
+            updateSippReadouts(
+                sippDiaRow,
+                sippPeakRow,
+                sippIsfRow,
+                sippBasalRow,
+                sippMaxBasalRow,
+                sippDiagRow
+            )
+            true
+        }
+        sippMaxBasalToggle.setOnPreferenceChangeListener { _, newValue ->
+            SippPrefs.setEnableMaxBasal(newValue as Boolean)
+            updateSippReadouts(
+                sippDiaRow,
+                sippPeakRow,
+                sippIsfRow,
+                sippBasalRow,
+                sippMaxBasalRow,
+                sippDiagRow
+            )
+            true
+        }
+
         siteLocationPref.setOnPreferenceChangeListener { pref, newValue ->
             val v = newValue as String
             SippPrefs.setSiteLocation(v)
