@@ -14,8 +14,10 @@ import kotlin.math.sqrt
  * - Persists per site; seeds from Profile on first tick if nothing saved.
  * - Safety rails + gentle decay to profile; no tightening while falling BG, neg IOB, or suspend.
  * - Exposes diagnostics so you can verify accuracy (RMSE/Bias/Confidence).
+ * - Optional activity fusion (cadence + HR) via onStep()/setHr()/setExerciseFlag().
  *
  * Call applyEvidence() once per loop; read current() from your insulin plugin.
+ * Feed steps/HR when available; otherwise SIPP falls back gracefully.
  */
 @Singleton
 class SentinelPkPdController @Inject constructor() {
@@ -45,6 +47,30 @@ class SentinelPkPdController @Inject constructor() {
             bias = if (count > 0) sumResidual / count else 0f,
             confidence = calcConfidence()
         )
+    }
+
+    // --- Optional activity inputs (thread-safe) ---
+
+    /** Feed heart rate (bpm) whenever you have it. Pass null to clear. */
+    fun setHr(bpm: Int?) = synchronized(this) {
+        hrLatest = bpm?.coerceIn(30, 220)
+    }
+
+    /** Optional user/app hint for exercise state; SIPP will fuse with cadence/HR. */
+    fun setExerciseFlag(flag: Boolean?) = synchronized(this) {
+        exerciseHint = flag
+    }
+
+    /** Feed raw step events (usually count=1 per pedometer tick). */
+    @Suppress("unused")
+    fun onStep(count: Int, tsMs: Long) = synchronized(this) {
+        if (count <= 0) return
+        initCadenceIfNeeded()
+        rollCadence(tsMs)
+        val idx = ((tsMs / 60000L) % CADENCE_BUCKETS.toLong()).toInt()
+        stepBuckets[idx] = (stepBuckets[idx] + count).coerceAtLeast(0)
+        lastCadenceTs = tsMs
+        recomputeCadenceDerivedLocked()
     }
 
     /**
@@ -90,25 +116,27 @@ class SentinelPkPdController @Inject constructor() {
             return
         }
 
+        // Fuse external hints with internal activity signals and keep cadence rolling
+        setHr(hr)
+        setExerciseFlag(inExercise)
+        if (cadenceInitialized) {
+            rollCadence(nowMs)
+            recomputeCadenceDerivedLocked()
+        }
+
         // Residual = actual - predicted (negative => insulin stronger than model)
         val residual = (bgNow - bgPred).toFloat()
         val absResidual = abs(residual)
 
-        // Track bolus edge for late-tail windows
-        noteBolusAge(minutesSinceLastBolus, nowMs)
-
         // --- Spike rejection: ignore single noisy ticks for learning ---
-        val steepSlope = abs(deltaPerMin).toFloat() > SPIKE_SLOPE_TH     // fast BG move
-        val bigJump = absResidual > SPIKE_RESIDUAL_TH                    // large residual
+        val steepSlope = abs(deltaPerMin).toFloat() > SPIKE_SLOPE_TH
+        val bigJump = absResidual > SPIKE_RESIDUAL_TH
         val recentlyUpdated = lastResidualTs != 0L &&
             (nowMs - lastResidualTs) <= SPIKE_WINDOW_MIN * 60_000L
-        val signFlip = lastResidual * residual < 0f                      // changed sign vs last tick
+        val signFlip = lastResidual * residual < 0f
 
-        // Example spike: steep slope + (big jump OR fast sign flip shortly after prev sample)
         val isSpike = steepSlope && (bigJump || (recentlyUpdated && signFlip))
-
         if (isSpike) {
-            // Keep telemetry for diagnostics, but do NOT adapt PK on this tick.
             pushTelem(residual)
             quietMin = 0f
             decayToward(baseDiaH, basePeakMin, 1.0f, dtMin)
@@ -132,8 +160,8 @@ class SentinelPkPdController @Inject constructor() {
         val bolusAgeMin = minutesSinceLastBolus.toFloat()
         val diaTailStartMin = baseDiaH * 60f * LATE_TAIL_START_FRAC
         val diaTailEndMin = baseDiaH * 60f * LATE_TAIL_END_FRAC
-        val inLateTailSimple = bolusAgeMin in diaTailStartMin..diaTailEndMin
-        val lateLow = inLateTailSimple && residual < -RESIDUAL_TH_STRONG
+        val inLateTail = bolusAgeMin in diaTailStartMin..diaTailEndMin
+        val lateLow = inLateTail && residual < -RESIDUAL_TH_STRONG
 
         val slowSiteScore =
             (if (earlySite) 1 else 0) +
@@ -143,65 +171,56 @@ class SentinelPkPdController @Inject constructor() {
                 (if (lateLow) 1 else 0)
         val slowSiteActive = slowSiteScore >= 2
 
-        // Activity → later peak & slightly weaker ISF
-        val exercise = (inExercise == true) || ((hr ?: 0) >= 100)
+        // -------- Activity fusion (cadence + HR + hint) --------
+        val spm = stepsPerMin
+        val sustainedActiveMin = activityWindowMin
+        val hrBpm = hrLatest
+
+        val cadenceActive = (spm != null && spm >= CADENCE_ACTIVE_SPM_MIN && sustainedActiveMin >= CADENCE_SUSTAIN_MIN)
+        val hrActive = (hrBpm != null && hrBpm >= HR_ACTIVE_MIN)
+        val hintActive = (exerciseHint == true)
+        val exercising = cadenceActive || hrActive || hintActive
+
+        // HR-scaled ISF bias (small, conservative)
         val hrBias = when {
-            (hr ?: 0) >= 140 -> 0.10f
-            (hr ?: 0) >= 120 -> 0.06f
-            (hr ?: 0) >= 100 -> 0.03f
-            else             -> 0.0f
+            hrBpm != null && hrBpm >= 140 -> 0.10f
+            hrBpm != null && hrBpm >= 120 -> 0.06f
+            hrBpm != null && hrBpm >= 100 -> 0.03f
+            else                          -> 0.0f
         }
-        val targetIsfMult = 1.0f * (1.0f + hrBias)
-        val targetPeakMin = (if (exercise) basePeakMin + 10 else basePeakMin)
-            .coerceIn(TPEAK_MIN_MIN, TPEAK_MAX_MIN)
+        // Cadence adds a little more, capped
+        val cadenceBias = if (cadenceActive) 0.02f else 0.0f
+        val targetIsfMult = 1.0f * (1.0f + (hrBias + cadenceBias).coerceAtMost(0.12f))
+
+        // Peak shift: during sustained activity, nudge later by up to +10 min (redistribution)
+        val peakShift = if (exercising) 10 else 0
+        val targetPeakMin = (basePeakMin + peakShift).coerceIn(TPEAK_MIN_MIN, TPEAK_MAX_MIN)
+        // -------------------------------------------------------
 
         // NEVER shorten DIA from residual/slope logic
         val strongInsulin = residual < -RESIDUAL_TH_STRONG || (falling && (negIob || prolongedSuspend))
         val weakInsulin = residual > RESIDUAL_TH_STRONG && !falling && !negIob && !prolongedSuspend
 
         if (strongInsulin) {
-            // insulin stronger → lengthen horizon, later peak, weaker ISF
             var stepScale = computeStepScale(absResidual)
-            // Late-low = very strong signal: ensure a minimum upward step
             if (lateLow) stepScale = max(stepScale, LATE_LOW_MIN_STEP_SCALE)
-
             diaH += DIA_STEP_UP * stepScale
             val peakStep = max(1, (TPEAK_STEP_MIN * stepScale).toInt())
             tPeakMin += peakStep
             isfMult += ISF_STEP_WEAKEN * stepScale
             quietMin = 0f
-            lockoutMin = max(lockoutMin, STRONG_LOCKOUT_MIN)
+            lockoutMin = STRONG_LOCKOUT_MIN
         } else if (weakInsulin) {
-            // insulin weaker → DO NOT shorten DIA; adjust ISF/peak gently
             val stepScale = computeStepScale(absResidual)
             val peakStep = max(1, (TPEAK_STEP_MIN * stepScale).toInt())
             isfMult -= ISF_STEP_STRENGTHEN * stepScale
             tPeakMin -= peakStep
             quietMin += dtMin
         } else {
-            // quiet → slow decay toward profile & activity targets
             if (!falling && !negIob && !prolongedSuspend) {
                 quietMin += dtMin
             }
             decayToward(baseDiaH, targetPeakMin, targetIsfMult, dtMin)
-        }
-
-        // --- NEW: robust late-tail EWMA nudges (3–8 h post-bolus), spike/suspend-aware ---
-        val inLT = inLateTailWindow(nowMs)
-        updateLateTail(residual, inLT, basalSuspendedMin)
-
-        val ltReady = ltCount >= 6 // need a few samples total before acting
-        if (ltReady) {
-            if (ltMedian < -4f) {
-                // persistent negative residual late → lengthen a bit
-                diaH += 0.10f
-                quietMin = 0f
-                lockoutMin = max(lockoutMin, 15f)
-            } else if (ltMedian > -2f && calcConfidence() >= 0.60f && quietMin >= 30f && lockoutMin <= 0f) {
-                // evidence clean → permit gentle downward drift (bounded)
-                val downCap = 0.07f * (dtMin / 60f) // RELAX_RATE_PER_H
-                diaH = max(baseDiaH, diaH - downCap)
-            }
         }
 
         // Floors & rails (slow-site + late-low floors)
@@ -227,10 +246,10 @@ class SentinelPkPdController @Inject constructor() {
     companion object {
 
         // --- Relaxation gate (allows DIA to come down safely) ---
-        private const val RELAX_UNLOCK_CONF: Float = 0.60f   // was 0.75
-        private const val RELAX_AFTER_MIN: Float = 30f       // was 60
-        private const val RELAX_RATE_PER_H: Float = 0.07f    // was 0.03
-        private const val STRONG_LOCKOUT_MIN: Float = 30f    // was 45
+        private const val RELAX_UNLOCK_CONF: Float = 0.75f
+        private const val RELAX_AFTER_MIN: Float = 60f
+        private const val RELAX_RATE_PER_H: Float = 0.03f
+        private const val STRONG_LOCKOUT_MIN: Float = 45f
 
         // Rails
         private const val DIA_MIN: Float = 4.5f
@@ -256,14 +275,20 @@ class SentinelPkPdController @Inject constructor() {
         private const val CUSUM_DECAY: Float = 0.85f
 
         // Spike rejection
-        private const val SPIKE_SLOPE_TH: Float = 3.0f        // mg/dL per min
-        private const val SPIKE_RESIDUAL_TH: Float = 20.0f    // mg/dL residual
-        private const val SPIKE_WINDOW_MIN: Long = 15L        // min
+        private const val SPIKE_SLOPE_TH: Float = 3.0f
+        private const val SPIKE_RESIDUAL_TH: Float = 20.0f
+        private const val SPIKE_WINDOW_MIN: Long = 15L
 
         // Late-low handling (tail of DIA)
         private const val LATE_TAIL_START_FRAC: Float = 0.6f
         private const val LATE_TAIL_END_FRAC: Float = 1.5f
         private const val LATE_LOW_MIN_STEP_SCALE: Float = 0.7f
+
+        // Cadence detector params
+        private const val CADENCE_BUCKETS = 10                 // 10×1-min buckets (rolling 10 min)
+        private const val CADENCE_ACTIVE_SPM_MIN = 60          // ≥60 steps/min considered active
+        private const val CADENCE_SUSTAIN_MIN = 5              // need ≥5 consecutive active minutes
+        private const val HR_ACTIVE_MIN = 100                  // HR heuristic for activity
     }
 
     // State (timers & dynamics)
@@ -287,10 +312,52 @@ class SentinelPkPdController @Inject constructor() {
     private var lastResidual: Float = 0f
     private var lastResidualTs: Long = 0L
 
-    // --- NEW: late-tail tracker state ---
-    private var ltMedian: Float = 0f
-    private var ltCount: Int = 0
-    private var lastBolusMs: Long = 0L
+    // Activity/cadence state
+    private var hrLatest: Int? = null
+    private var exerciseHint: Boolean? = null
+
+    private var cadenceInitialized = false
+    private var stepBuckets = IntArray(CADENCE_BUCKETS)       // zero-initialized
+    private var lastCadenceTs: Long = 0L
+    private var stepsPerMin: Int? = null
+    private var activityWindowMin: Int = 0
+
+    private fun initCadenceIfNeeded() {
+        if (!cadenceInitialized) {
+            cadenceInitialized = true
+            lastCadenceTs = System.currentTimeMillis()
+            stepBuckets.fill(0)
+            stepsPerMin = null
+            activityWindowMin = 0
+        }
+    }
+
+    /** Advance ring buffer up to current minute, zeroing skipped minutes and updating sustained count. */
+    private fun rollCadence(tsMs: Long) {
+        if (!cadenceInitialized) return
+        val lastMin = lastCadenceTs / 60000L
+        val curMin = tsMs / 60000L
+        var m = lastMin
+        while (m < curMin) {
+            m++
+            val idx = (m % CADENCE_BUCKETS).toInt()
+            val endedIdx = ((m - 1) % CADENCE_BUCKETS).toInt()
+            val endedSpm = stepBuckets[endedIdx]
+            activityWindowMin = if (endedSpm >= CADENCE_ACTIVE_SPM_MIN) {
+                (activityWindowMin + 1).coerceAtMost(CADENCE_BUCKETS)
+            } else 0
+            stepBuckets[idx] = 0
+        }
+        lastCadenceTs = tsMs
+    }
+
+    /** Recompute SPM over the most recent complete minute. */
+    private fun recomputeCadenceDerivedLocked() {
+        val curMin = (lastCadenceTs / 60000L)
+        val endedIdx = ((curMin - 1).coerceAtLeast(0) % CADENCE_BUCKETS).toInt()
+        val spm = if (lastCadenceTs == 0L) 0 else stepBuckets[endedIdx]
+        stepsPerMin = if (spm > 0) spm else null
+    }
 
     private fun tryRestoreOnce(): Boolean {
         if (restored) return true
@@ -317,10 +384,8 @@ class SentinelPkPdController @Inject constructor() {
                 calcConfidence() >= RELAX_UNLOCK_CONF &&
                 quietMin >= RELAX_AFTER_MIN
 
-        // If allowed, target is baseline; otherwise never shorter than current
         val diaTarget = if (allowRelax) baseDiaH else max(baseDiaH, diaH)
 
-        // Apply a gentle cap on per-tick downward move
         val nextDia = diaH + (diaTarget - diaH) * k
         val maxDownStep = (RELAX_RATE_PER_H * (dtMin / 60.0f))
         diaH = if (allowRelax && nextDia < diaH) {
@@ -329,16 +394,10 @@ class SentinelPkPdController @Inject constructor() {
             nextDia
         }
 
-        // Peak & ISF tween
         tPeakMin += ((targetPeakMin - tPeakMin).toFloat() * k).toInt()
         isfMult += (targetIsfMult - isfMult) * k
     }
 
-    /**
-     * ABS-weighted step scaling:
-     * - Just above threshold → small step (0.3x)
-     * - Larger residuals → up to full step (1.0x)
-     */
     private fun computeStepScale(absResidual: Float): Float {
         val raw = absResidual / (RESIDUAL_TH_STRONG * 2f)
         return raw.coerceIn(0.3f, 1.0f)
@@ -361,29 +420,5 @@ class SentinelPkPdController @Inject constructor() {
         val rmseScore = (1f - (rmse / 30f)).coerceIn(0f, 1f)    // 30 mg/dL soft bound
         val biasScore = (1f - (abs(b) / 15f)).coerceIn(0f, 1f)  // 15 mg/dL soft bound
         return (0.6f * rmseScore + 0.4f * biasScore)
-    }
-
-    // --- NEW: late-tail helpers ---
-    private fun inLateTailWindow(nowMs: Long): Boolean {
-        if (lastBolusMs == 0L) return false
-        val minW = 3L * 60L * 60L * 1000L   // 3 h
-        val maxW = 8L * 60L * 60L * 1000L   // 8 h
-        val dt = nowMs - lastBolusMs
-        return dt in minW..maxW
-    }
-
-    private fun noteBolusAge(minutesSinceLastBolus: Int, nowMs: Long) {
-        // Refresh anchor when a bolus is very recent (1–2 min) to avoid missing the window
-        if (minutesSinceLastBolus in 1..2) lastBolusMs = nowMs
-    }
-
-    private fun updateLateTail(residual: Float, inWindow: Boolean, basalSuspendedMin: Int) {
-        if (!inWindow) return
-        if (basalSuspendedMin > 0) return // skip windows distorted by suspend
-        // robust EWMA of clamped residuals (–10..+10 mg/dL)
-        val r = residual.coerceIn(-10f, 10f)
-        val alpha = 0.15f
-        ltMedian = (1f - alpha) * ltMedian + alpha * r
-        if (abs(r) <= 10f) ltCount = (ltCount + 1).coerceAtMost(1000)
     }
 }

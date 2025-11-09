@@ -1,5 +1,6 @@
 package app.aaps.plugins.aps.openAPSSMB
 
+// === NEW imports for HR/Steps wiring ===
 import android.content.Context
 import android.content.Intent
 import androidx.collection.LongSparseArray
@@ -42,6 +43,7 @@ import app.aaps.core.interfaces.profiling.Profiler
 import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.interfaces.rx.events.EventAPSCalculationFinished
+import app.aaps.core.interfaces.rx.weardata.EventData
 import app.aaps.core.interfaces.stats.TddCalculator
 import app.aaps.core.interfaces.ui.UiInteraction
 import app.aaps.core.interfaces.utils.DateUtil
@@ -74,6 +76,7 @@ import app.aaps.plugins.aps.events.EventOpenAPSUpdateGui
 import app.aaps.plugins.aps.events.EventResetOpenAPSGui
 import app.aaps.plugins.insulin.sipp.SentinelPkPdController
 import app.aaps.plugins.insulin.sipp.SippPrefs
+import io.reactivex.rxjava3.disposables.CompositeDisposable
 import org.json.JSONObject
 import java.util.Locale
 import javax.inject.Inject
@@ -82,6 +85,7 @@ import javax.inject.Singleton
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 @Singleton
 open class OpenAPSSMBPlugin @Inject constructor(
@@ -124,16 +128,20 @@ open class OpenAPSSMBPlugin @Inject constructor(
 ), APS, PluginConstraints {
 
     // ===== Adaptive + safe clamp defaults =====
-    private val bolusLookbackPerDiaFrac = 0.04          // minutes = frac × DIA(min)
-    private val bolusLookbackMin = 45                    // min
-    private val bolusLookbackMax = 90                    // min
+    private val bolusLookbackPerDiaFrac = 0.04
+    private val bolusLookbackMin = 45
+    private val bolusLookbackMax = 90
 
-    private val bolusSumPer30MinPerTdd = 0.03           // U threshold = frac × TDD7d
-    private val bolusSumPer30MinMin = 0.6               // U
-    private val bolusSumPer30MinMax = 1.5               // U
+    private val bolusSumPer30MinPerTdd = 0.03
+    private val bolusSumPer30MinMin = 0.6
+    private val bolusSumPer30MinMax = 1.5
 
-    private val basalExcessRatio = 1.20                 // ≥120% of scheduled
-    private val suspendRecentMin = 15                    // min
+    private val basalExcessRatio = 1.20
+    private val suspendRecentMin = 15
+
+    // === NEW: wear subscriptions & simple dedupe for steps ===
+    private val wearDisposables = CompositeDisposable()
+    @Volatile private var lastStepIngestMin: Long = -1
 
     override fun onStart() {
         super.onStart()
@@ -148,6 +156,56 @@ open class OpenAPSSMBPlugin @Inject constructor(
             count++
         }
         aapsLogger.debug(LTag.APS, "Loaded $count variable sensitivity values from database")
+
+        // === NEW: Wire HR + Steps from Wear into SIPP ===
+        runCatching {
+            // Heart Rate
+            val hrSub = rxBus
+                .toObservable(EventData.ActionHeartRate::class.java)
+                .subscribe({ hrEvt ->
+                               // beatsPerMinute is Double in most builds; round & clamp to sane range
+                               val bpm = hrEvt.beatsPerMinute.roundToInt().coerceIn(30, 220)
+                               sentinelController.setHr(bpm)
+                               aapsLogger.debug(LTag.APS, "SIPP HR wired: $bpm bpm @${hrEvt.timestamp}")
+                           }, { e ->
+                               aapsLogger.error(LTag.APS, "HR→SIPP subscription error", e)
+                           })
+            wearDisposables.add(hrSub)
+
+            // Steps Rate (derive approx steps/min from the shortest non-zero window)
+            val stepsSub = rxBus
+                .toObservable(EventData.ActionStepsRate::class.java)
+                .subscribe({ stEvt ->
+                               val perMin = when {
+                                   stEvt.steps5min != 0  -> (stEvt.steps5min / 5).coerceAtLeast(0)
+                                   stEvt.steps10min != 0 -> (stEvt.steps10min / 10).coerceAtLeast(0)
+                                   stEvt.steps15min != 0 -> (stEvt.steps15min / 15).coerceAtLeast(0)
+                                   else                  -> 0
+                               }
+                               if (perMin > 0) {
+                                   val minuteTs = stEvt.timestamp / 60_000L
+                                   if (minuteTs != lastStepIngestMin) {
+                                       // Feed the derived cadence as a single "step event" for this minute
+                                       sentinelController.onStep(perMin, stEvt.timestamp)
+                                       lastStepIngestMin = minuteTs
+                                       aapsLogger.debug(
+                                           LTag.APS,
+                                           "SIPP STEPS wired: ~${perMin} spm @${stEvt.timestamp}"
+                                       )
+                                   }
+                               }
+                           }, { e ->
+                               aapsLogger.error(LTag.APS, "STEPS→SIPP subscription error", e)
+                           })
+            wearDisposables.add(stepsSub)
+        }.onFailure {
+            aapsLogger.error(LTag.APS, "Wear wiring start failed", it)
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        wearDisposables.clear()
     }
 
     // last values
@@ -347,9 +405,6 @@ open class OpenAPSSMBPlugin @Inject constructor(
 
     /**
      * Compute & persist SIPP Instant Basal (U/h) and SIPP Max Basal (U/h) based on the ISF actually used.
-     * - Instant basal ≈ 45% of TDD / 24
-     * - Max basal suggestion = max(1.8×scheduled, 3×instantBasal, maxDailyBasal×prefDailyMultiplier),
-     *   clamped to HardLimits.maxBasal().
      */
     private fun persistInstantAndMaxBasal(profile: Profile, sensMgdl: Double) {
         if (sensMgdl <= 0.0) return
@@ -625,11 +680,10 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 }
 
                 // Base DIA/Peak for SIPP seeding, optionally overridden by SIPP insulin archetype.
-                // AUTO = use current profile + InsulinOrefPeak preference.
                 val (baseDiaH, basePeakMin) = when (SippPrefs.insulinArchetype()) {
-                    "RAPID"   -> 5.0f to 75   // Humalog / NovoRapid style
-                    "FIASP"   -> 4.0f to 60   // Fiasp-style: earlier peak
-                    "LYUMJEV" -> 3.5f to 50   // Lyumjev-style: even earlier peak
+                    "RAPID"   -> 5.0f to 75
+                    "FIASP"   -> 4.0f to 60
+                    "LYUMJEV" -> 3.5f to 50
                     else      -> profile.dia.toFloat() to preferences.get(IntKey.InsulinOrefPeak)
                 }
 
@@ -656,8 +710,8 @@ open class OpenAPSSMBPlugin @Inject constructor(
 
         val sensForJs: Double = when {
             SippPrefs.enableIsf() && instantIsfMgdl != null && instantIsfMgdl > 0.0 -> instantIsfMgdl
-            dsOn && instantIsfMgdl != null && instantIsfMgdl > 0.0 -> instantIsfMgdl
-            else                                                   -> baseIsfMgdl
+            preferences.get(BooleanKey.ApsUseDynamicSensitivity) && instantIsfMgdl != null && instantIsfMgdl > 0.0 -> instantIsfMgdl
+            else                                                                                                   -> baseIsfMgdl
         }
 
         // Persist ISF readouts (used and raw)
@@ -682,8 +736,8 @@ open class OpenAPSSMBPlugin @Inject constructor(
                     unit,
                     when {
                         SippPrefs.enableIsf() && instantIsfMgdl != null -> "SIPP"
-                        dsOn && instantIsfMgdl != null -> "DS"
-                        else                           -> "Profile"
+                        preferences.get(BooleanKey.ApsUseDynamicSensitivity) && instantIsfMgdl != null -> "DS"
+                        else                                                                           -> "Profile"
                     }
                 )
             )
