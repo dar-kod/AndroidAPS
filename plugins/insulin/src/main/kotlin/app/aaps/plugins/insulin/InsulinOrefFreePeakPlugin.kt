@@ -605,5 +605,75 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             sippMaxBasalRow,
             sippDiagRow
         )
+
+        // ===== NEW: SIPP – Activity fusion UI (master + HR + Steps) =====
+        addSippActivityPrefs(parent, context)
+    }
+
+    // ---------- SIPP Activity Fusion UI ----------
+    private var hrPrefRef: SwitchPreferenceCompat? = null
+    private var stepsPrefRef: SwitchPreferenceCompat? = null
+
+    private fun addSippActivityPrefs(
+        parent: PreferenceScreen,
+        context: Context
+    ) {
+        // Ensure prefs are ready
+        SippPrefs.init(context)
+
+        val category = PreferenceCategory(context).apply {
+            key = "sipp_activity_fusion"
+            title = "SIPP – Activity fusion"
+            initialExpandedChildrenCount = 0
+        }
+        parent.addPreference(category)
+
+        // Master toggle
+        val master = SwitchPreferenceCompat(context).apply {
+            key = "sipp_enable_activity_fusion_ui" // UI key; real state in SippPrefs
+            title = "Use activity fusion (HR & steps)"
+            summary = "Slight ISF weakening and up to +10 min peak shift during sustained activity; DIA never shortened."
+            isChecked = SippPrefs.enableActivityFusion()
+            setOnPreferenceChangeListener { _, newValue ->
+                val on = newValue as Boolean
+                SippPrefs.setEnableActivityFusion(on)
+                hrPrefRef?.isEnabled = on
+                stepsPrefRef?.isEnabled = on
+                true
+            }
+        }
+
+        // Sub: Heart rate
+        val hrPref = SwitchPreferenceCompat(context).apply {
+            key = "sipp_use_hr_ui"
+            title = "Use heart-rate"
+            summary = "Treat HR ≥100 bpm as activity (small, capped ISF weakening)."
+            isChecked = SippPrefs.useHr()
+            isEnabled = SippPrefs.enableActivityFusion()
+            setOnPreferenceChangeListener { _, newValue ->
+                SippPrefs.setUseHr(newValue as Boolean)
+                true
+            }
+        }
+
+        // Sub: Steps / cadence
+        val stepsPref = SwitchPreferenceCompat(context).apply {
+            key = "sipp_use_steps_ui"
+            title = "Use steps / cadence"
+            summary = "Active when ≥60 steps/min for ≥5 min (small ISF weakening; up to +10 min peak)."
+            isChecked = SippPrefs.useSteps()
+            isEnabled = SippPrefs.enableActivityFusion()
+            setOnPreferenceChangeListener { _, newValue ->
+                SippPrefs.setUseSteps(newValue as Boolean)
+                true
+            }
+        }
+
+        hrPrefRef = hrPref
+        stepsPrefRef = stepsPref
+
+        category.addPreference(master)
+        category.addPreference(hrPref)
+        category.addPreference(stepsPref)
     }
 }
