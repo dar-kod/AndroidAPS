@@ -15,9 +15,9 @@ import kotlin.math.sqrt
  * - Safety rails + gentle decay to profile; no tightening while falling BG, neg IOB, or suspend.
  * - Exposes diagnostics so you can verify accuracy (RMSE/Bias/Confidence).
  * - Optional activity fusion (cadence + HR) via onStep()/setHr()/setExerciseFlag().
+ * - activitySnapshot() exposes the live activity evidence & effect used this tick.
  *
  * Call applyEvidence() once per loop; read current() from your insulin plugin.
- * Feed steps/HR when available; otherwise SIPP falls back gracefully.
  */
 @Singleton
 class SentinelPkPdController @Inject constructor() {
@@ -36,6 +36,23 @@ class SentinelPkPdController @Inject constructor() {
         val confidence: Float // 0..1 (higher => more trustworthy)
     )
 
+    /** Snapshot of the activity fusion inputs and the tiny effects SIPP applied this tick. */
+    data class ActivitySnapshot(
+        val hrBpm: Int?,                // last HR we saw (null if none)
+        val stepsPerMin: Int?,          // SPM over the last complete minute (null if none)
+        val sustainedActiveMin: Int,    // rolling "active minutes" within 10-min window
+        val fusionEnabled: Boolean,     // master toggle on?
+        val cadenceEnabled: Boolean,    // steps/cadence sub-toggle on?
+        val hrEnabled: Boolean,         // HR sub-toggle on?
+        val cadenceActive: Boolean,     // met cadence criteria this tick (and toggle enabled)
+        val hrActive: Boolean,          // met HR criteria this tick (and toggle enabled)
+        val hintActive: Boolean,        // app/user exercise flag latched
+        val exercising: Boolean,        // any of the above true (and fusion enabled)
+        val peakShiftMin: Int,          // +0..+10 min peak shift applied
+        val isfScaleApplied: Float,     // ×1.00..×1.12 (small weakening only)
+        val lastTickMs: Long            // controller's last evidence time
+    )
+
     fun current(): Estimates = synchronized(this) {
         Estimates(diaH = diaH, peakH = tPeakMin / 60f, isfScale = isfMult)
     }
@@ -46,6 +63,25 @@ class SentinelPkPdController @Inject constructor() {
             rmse = calcRmse(),
             bias = if (count > 0) sumResidual / count else 0f,
             confidence = calcConfidence()
+        )
+    }
+
+    /** Build-safe readout for UI/testers to see *why* SIPP nudged ISF/peak. */
+    fun activitySnapshot(): ActivitySnapshot = synchronized(this) {
+        ActivitySnapshot(
+            hrBpm = hrLatest,
+            stepsPerMin = stepsPerMin,
+            sustainedActiveMin = activityWindowMin,
+            fusionEnabled = lastFusionEnabled,
+            cadenceEnabled = lastCadenceToggleEnabled,
+            hrEnabled = lastHrToggleEnabled,
+            cadenceActive = lastCadenceActive,
+            hrActive = lastHrActive,
+            hintActive = (exerciseHint == true),
+            exercising = lastExercising,
+            peakShiftMin = lastPeakShiftMin,
+            isfScaleApplied = lastTargetIsfMultUsed,
+            lastTickMs = lastTickMs
         )
     }
 
@@ -111,6 +147,16 @@ class SentinelPkPdController @Inject constructor() {
 
         // If PK is disabled or sensor is bad → gently drift toward profile targets and persist.
         if (!SippPrefs.enablePk() || !sensorOk) {
+            // Reset last-applied fusion effect for clarity in snapshot
+            lastFusionEnabled = false
+            lastHrToggleEnabled = false
+            lastCadenceToggleEnabled = false
+            lastHrActive = false
+            lastCadenceActive = false
+            lastExercising = false
+            lastPeakShiftMin = 0
+            lastTargetIsfMultUsed = 1.0f
+
             decayToward(baseDiaH, basePeakMin, 1.0f, dtMin)
             persist(nowMs)
             return
@@ -139,6 +185,11 @@ class SentinelPkPdController @Inject constructor() {
         if (isSpike) {
             pushTelem(residual)
             quietMin = 0f
+            // maintain snapshot (but no fusion application on spike path)
+            lastPeakShiftMin = 0
+            lastTargetIsfMultUsed = 1.0f
+            lastExercising = false
+
             decayToward(baseDiaH, basePeakMin, 1.0f, dtMin)
             lastResidual = residual
             lastResidualTs = nowMs
@@ -171,31 +222,56 @@ class SentinelPkPdController @Inject constructor() {
                 (if (lateLow) 1 else 0)
         val slowSiteActive = slowSiteScore >= 2
 
-        // -------- Activity fusion (cadence + HR + hint) --------
+        // -------- Activity fusion (cadence + HR + hint), respecting toggles --------
+        val masterEnabled = SippPrefs.enableActivityFusion()
+        val cadenceToggleEnabled = SippPrefs.useSteps()
+        val hrToggleEnabled = SippPrefs.useHr()
+
         val spm = stepsPerMin
         val sustainedActiveMin = activityWindowMin
-        val hrBpm = hrLatest
+        val hrBpm = hrLatest ?: 0
 
-        val cadenceActive = (spm != null && spm >= CADENCE_ACTIVE_SPM_MIN && sustainedActiveMin >= CADENCE_SUSTAIN_MIN)
-        val hrActive = (hrBpm != null && hrBpm >= HR_ACTIVE_MIN)
+        val cadenceActiveRaw =
+            (stepsPerMin != null && spm != null && spm >= CADENCE_ACTIVE_SPM_MIN && sustainedActiveMin >= CADENCE_SUSTAIN_MIN)
+        val hrActiveRaw = (hrLatest != null && hrBpm >= HR_ACTIVE_MIN)
         val hintActive = (exerciseHint == true)
-        val exercising = cadenceActive || hrActive || hintActive
 
-        // HR-scaled ISF bias (small, conservative)
-        val hrBias = when {
-            hrBpm != null && hrBpm >= 140 -> 0.10f
-            hrBpm != null && hrBpm >= 120 -> 0.06f
-            hrBpm != null && hrBpm >= 100 -> 0.03f
-            else                          -> 0.0f
-        }
+        // Respect the toggles
+        val cadenceActive = cadenceToggleEnabled && cadenceActiveRaw
+        val hrActive = hrToggleEnabled && hrActiveRaw
+
+        val exercising = masterEnabled && (cadenceActive || hrActive || hintActive)
+
+        // HR-scaled ISF bias (small, conservative) — no nullable checks needed:
+        // if hrActive is true, hrBpm >= 100 by definition.
+        val hrBias = if (hrActive) {
+            when {
+                hrBpm >= 140 -> 0.10f
+                hrBpm >= 120 -> 0.06f
+                else         -> 0.03f // hrActive ⇒ ≥100
+            }
+        } else 0.0f
+
         // Cadence adds a little more, capped
         val cadenceBias = if (cadenceActive) 0.02f else 0.0f
-        val targetIsfMult = 1.0f * (1.0f + (hrBias + cadenceBias).coerceAtMost(0.12f))
+
+        val fusionBias = (hrBias + cadenceBias).coerceAtMost(0.12f)
+        val targetIsfMult = if (exercising) 1.0f * (1.0f + fusionBias) else 1.0f
 
         // Peak shift: during sustained activity, nudge later by up to +10 min (redistribution)
         val peakShift = if (exercising) 10 else 0
         val targetPeakMin = (basePeakMin + peakShift).coerceIn(TPEAK_MIN_MIN, TPEAK_MAX_MIN)
-        // -------------------------------------------------------
+
+        // Record snapshot for UI/testers
+        lastFusionEnabled = masterEnabled
+        lastHrToggleEnabled = hrToggleEnabled
+        lastCadenceToggleEnabled = cadenceToggleEnabled
+        lastHrActive = hrActive
+        lastCadenceActive = cadenceActive
+        lastExercising = exercising
+        lastPeakShiftMin = peakShift
+        lastTargetIsfMultUsed = targetIsfMult
+        // ---------------------------------------------------------------------------
 
         // NEVER shorten DIA from residual/slope logic
         val strongInsulin = residual < -RESIDUAL_TH_STRONG || (falling && (negIob || prolongedSuspend))
@@ -321,6 +397,16 @@ class SentinelPkPdController @Inject constructor() {
     private var lastCadenceTs: Long = 0L
     private var stepsPerMin: Int? = null
     private var activityWindowMin: Int = 0
+
+    // Last-applied activity fusion bookkeeping (for snapshot/readout)
+    private var lastFusionEnabled: Boolean = false
+    private var lastHrToggleEnabled: Boolean = false
+    private var lastCadenceToggleEnabled: Boolean = false
+    private var lastHrActive: Boolean = false
+    private var lastCadenceActive: Boolean = false
+    private var lastExercising: Boolean = false
+    private var lastPeakShiftMin: Int = 0
+    private var lastTargetIsfMultUsed: Float = 1.0f
 
     private fun initCadenceIfNeeded() {
         if (!cadenceInitialized) {
