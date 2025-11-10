@@ -36,6 +36,7 @@ import kotlin.math.roundToInt
 /**
  * Oref Free-Peak insulin with SIPP PK handoff (DIA/Peak),
  * SIPP Instant-ISF readout (RAW exp-TDD), and SIPP Basal / Max Basal readouts.
+ * Adds SIPP activity-evidence readout (HR/SPM/sustain + ISF×, +Peak).
  */
 @Singleton
 class InsulinOrefFreePeakPlugin @Inject constructor(
@@ -170,7 +171,7 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             )
         }
 
-        // Peak readout with new saturating cap
+        // Peak readout with saturating cap
         if (sippPkOn) {
             val fromSippMin = (persisted?.tPeakMin
                 ?: (sipp.current().peakH?.times(60f)?.roundToInt() ?: profPeakMin))
@@ -297,11 +298,11 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         // Initialize plugin-local prefs store
         SippPrefs.init(context)
 
-        // ===== Free-Peak section =====
+        // ===== Free-Peak section (collapsed) =====
         val fpCat = PreferenceCategory(context).apply {
             key = "insulin_free_peak_settings"
             title = rh.gs(R.string.insulin_oref_peak)
-            initialExpandedChildrenCount = Int.MAX_VALUE
+            initialExpandedChildrenCount = 0 // collapsed → arrow to expand
         }
         parent.addPreference(fpCat)
         fpCat.addPreference(
@@ -312,11 +313,11 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             )
         )
 
-        // ===== SIPP section =====
+        // ===== SIPP section (collapsed) =====
         val sippCategory = PreferenceCategory(context).also {
             it.key = "insulin_sipp_settings"
             it.title = "SIPP (Sentinel Instant PK/PD)"
-            it.initialExpandedChildrenCount = Int.MAX_VALUE
+            it.initialExpandedChildrenCount = 0 // collapsed → arrow to expand
         }
         parent.addPreference(sippCategory)
 
@@ -474,13 +475,9 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             sippIsf.isEnabled = SippPrefs.enablePk() && !preferences.get(BooleanKey.ApsUseDynamicSensitivity)
             sippDiaExpert.isEnabled = SippPrefs.enablePk()
             updateSippReadouts(
-                sippDiaRow,
-                sippPeakRow,
-                sippIsfRow,
-                sippBasalRow,
-                sippMaxBasalRow,
-                sippDiagRow
+                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
             )
+            updateActivityReadout()
             true
         }
         sippIsf.setOnPreferenceChangeListener { _, newValue ->
@@ -491,25 +488,17 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             }
             SippPrefs.setEnableIsf(on)
             updateSippReadouts(
-                sippDiaRow,
-                sippPeakRow,
-                sippIsfRow,
-                sippBasalRow,
-                sippMaxBasalRow,
-                sippDiagRow
+                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
             )
+            updateActivityReadout()
             true
         }
         sippDiaExpert.setOnPreferenceChangeListener { _, newValue ->
             SippPrefs.setAllowDiaAbove9h(newValue as Boolean)
             updateSippReadouts(
-                sippDiaRow,
-                sippPeakRow,
-                sippIsfRow,
-                sippBasalRow,
-                sippMaxBasalRow,
-                sippDiagRow
+                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
             )
+            updateActivityReadout()
             true
         }
 
@@ -517,25 +506,17 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         sippBasalToggle.setOnPreferenceChangeListener { _, newValue ->
             SippPrefs.setEnableBasal(newValue as Boolean)
             updateSippReadouts(
-                sippDiaRow,
-                sippPeakRow,
-                sippIsfRow,
-                sippBasalRow,
-                sippMaxBasalRow,
-                sippDiagRow
+                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
             )
+            updateActivityReadout()
             true
         }
         sippMaxBasalToggle.setOnPreferenceChangeListener { _, newValue ->
             SippPrefs.setEnableMaxBasal(newValue as Boolean)
             updateSippReadouts(
-                sippDiaRow,
-                sippPeakRow,
-                sippIsfRow,
-                sippBasalRow,
-                sippMaxBasalRow,
-                sippDiagRow
+                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
             )
+            updateActivityReadout()
             true
         }
 
@@ -544,13 +525,9 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             SippPrefs.setSiteLocation(v)
             pref.summary = "Current: $v"
             updateSippReadouts(
-                sippDiaRow,
-                sippPeakRow,
-                sippIsfRow,
-                sippBasalRow,
-                sippMaxBasalRow,
-                sippDiagRow
+                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
             )
+            updateActivityReadout()
             true
         }
         siteAgeEnabledPref.setOnPreferenceChangeListener { _, newValue ->
@@ -558,13 +535,9 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             SippPrefs.setSiteAgeEnabled(on)
             siteAgePref.isEnabled = on
             updateSippReadouts(
-                sippDiaRow,
-                sippPeakRow,
-                sippIsfRow,
-                sippBasalRow,
-                sippMaxBasalRow,
-                sippDiagRow
+                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
             )
+            updateActivityReadout()
             true
         }
         siteAgePref.setOnPreferenceChangeListener { pref, newValue ->
@@ -572,13 +545,9 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             SippPrefs.setSiteAgeH(v)
             pref.summary = "Current: $v"
             updateSippReadouts(
-                sippDiaRow,
-                sippPeakRow,
-                sippIsfRow,
-                sippBasalRow,
-                sippMaxBasalRow,
-                sippDiagRow
+                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
             )
+            updateActivityReadout()
             true
         }
 
@@ -586,33 +555,25 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         sippRefresh.setOnPreferenceClickListener {
             rxBus.send(EventNewBG(System.currentTimeMillis()))
             updateSippReadouts(
-                sippDiaRow,
-                sippPeakRow,
-                sippIsfRow,
-                sippBasalRow,
-                sippMaxBasalRow,
-                sippDiagRow
+                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
             )
+            updateActivityReadout()
             true
         }
 
         // Initial fill (will use persisted state if present)
         updateSippReadouts(
-            sippDiaRow,
-            sippPeakRow,
-            sippIsfRow,
-            sippBasalRow,
-            sippMaxBasalRow,
-            sippDiagRow
+            sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
         )
 
-        // ===== NEW: SIPP – Activity fusion UI (master + HR + Steps) =====
+        // ===== NEW: SIPP – Activity fusion UI (master + HR + Steps), collapsed =====
         addSippActivityPrefs(parent, context)
     }
 
     // ---------- SIPP Activity Fusion UI ----------
     private var hrPrefRef: SwitchPreferenceCompat? = null
     private var stepsPrefRef: SwitchPreferenceCompat? = null
+    private var activityReadoutRef: Preference? = null
 
     private fun addSippActivityPrefs(
         parent: PreferenceScreen,
@@ -624,7 +585,7 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         val category = PreferenceCategory(context).apply {
             key = "sipp_activity_fusion"
             title = "SIPP – Activity fusion"
-            initialExpandedChildrenCount = 0
+            initialExpandedChildrenCount = 0 // collapsed by default (arrow visible)
         }
         parent.addPreference(category)
 
@@ -632,13 +593,14 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         val master = SwitchPreferenceCompat(context).apply {
             key = "sipp_enable_activity_fusion_ui" // UI key; real state in SippPrefs
             title = "Use activity fusion (HR & steps)"
-            summary = "Slight ISF weakening and up to +10 min peak shift during sustained activity; DIA never shortened."
+            summary = "Small ISF weakening (+3–12%) and up to +10 min peak shift during sustained activity; DIA never shortened."
             isChecked = SippPrefs.enableActivityFusion()
             setOnPreferenceChangeListener { _, newValue ->
                 val on = newValue as Boolean
                 SippPrefs.setEnableActivityFusion(on)
                 hrPrefRef?.isEnabled = on
                 stepsPrefRef?.isEnabled = on
+                updateActivityReadout()
                 true
             }
         }
@@ -647,11 +609,12 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         val hrPref = SwitchPreferenceCompat(context).apply {
             key = "sipp_use_hr_ui"
             title = "Use heart-rate"
-            summary = "Treat HR ≥100 bpm as activity (small, capped ISF weakening)."
+            summary = "Treat HR ≥100 bpm as activity (adds small, capped ISF weakening)."
             isChecked = SippPrefs.useHr()
             isEnabled = SippPrefs.enableActivityFusion()
             setOnPreferenceChangeListener { _, newValue ->
                 SippPrefs.setUseHr(newValue as Boolean)
+                updateActivityReadout()
                 true
             }
         }
@@ -660,20 +623,68 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         val stepsPref = SwitchPreferenceCompat(context).apply {
             key = "sipp_use_steps_ui"
             title = "Use steps / cadence"
-            summary = "Active when ≥60 steps/min for ≥5 min (small ISF weakening; up to +10 min peak)."
+            summary = "Active when ≥60 steps/min for ≥5 min (adds small ISF weakening; up to +10 min peak)."
             isChecked = SippPrefs.useSteps()
             isEnabled = SippPrefs.enableActivityFusion()
             setOnPreferenceChangeListener { _, newValue ->
                 SippPrefs.setUseSteps(newValue as Boolean)
+                updateActivityReadout()
                 true
             }
         }
 
+        // Readout: Activity evidence & applied effect
+        val activityReadout = Preference(context).apply {
+            key = "sipp_readout_activity"
+            title = "Activity evidence"
+            isSelectable = false
+        }
+
         hrPrefRef = hrPref
         stepsPrefRef = stepsPref
+        activityReadoutRef = activityReadout
 
         category.addPreference(master)
         category.addPreference(hrPref)
         category.addPreference(stepsPref)
+        category.addPreference(activityReadout)
+
+        // Initial fill of the activity readout
+        updateActivityReadout()
+    }
+
+    /** Builds a concise, single-line summary of HR/SPM evidence and tiny effects applied. */
+    private fun updateActivityReadout() {
+        val row = activityReadoutRef ?: return
+        runCatching {
+            val snap = sipp.activitySnapshot()
+            val hr = snap.hrBpm?.toString() ?: "—"
+            val spm = snap.stepsPerMin?.toString() ?: "—"
+            val sustain = snap.sustainedActiveMin
+            val onOff = if (snap.fusionEnabled) "ON" else "OFF"
+
+            // Use toggles in the final string (no unused-variable warning)
+            val togglesStr = buildString {
+                append("hr="); append(if (snap.hrEnabled) "ON" else "OFF")
+                append(", steps="); append(if (snap.cadenceEnabled) "ON" else "OFF")
+            }
+
+            val actFlags = buildString {
+                val flags = mutableListOf<String>()
+                if (snap.hrActive) flags += "HR"
+                if (snap.cadenceActive) flags += "Steps"
+                if (snap.hintActive) flags += "Hint"
+                append(if (flags.isEmpty()) "—" else flags.joinToString("+"))
+            }
+            val isfPct = ((snap.isfScaleApplied - 1.0f) * 100f)
+            val isfStr = if (isfPct >= 0.05f) String.format(Locale.getDefault(), "+%.0f%%", isfPct) else "0%"
+            val peakStr = if (snap.peakShiftMin > 0) "+${snap.peakShiftMin} min" else "0 min"
+
+            row.summary =
+                "Fusion: $onOff  |  Toggles: $togglesStr  |  HR: $hr bpm  |  SPM: $spm  |  Sustained: ${sustain}m  |  Active: $actFlags  |  ISF: $isfStr  |  Peak: $peakStr"
+        }.onFailure {
+            row.summary =
+                "Fusion: —  |  Toggles: —  |  HR: —  |  SPM: —  |  Sustained: —  |  Active: —  |  ISF: —  |  Peak: —"
+        }
     }
 }
