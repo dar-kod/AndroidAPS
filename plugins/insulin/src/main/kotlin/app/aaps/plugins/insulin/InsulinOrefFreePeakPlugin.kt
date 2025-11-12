@@ -16,6 +16,7 @@ import app.aaps.core.interfaces.plugin.PluginDescription
 import app.aaps.core.interfaces.profile.ProfileFunction
 import app.aaps.core.interfaces.resources.ResourceHelper
 import app.aaps.core.interfaces.rx.bus.RxBus
+import app.aaps.core.interfaces.rx.events.EventAPSCalculationFinished
 import app.aaps.core.interfaces.rx.events.EventNewBG
 import app.aaps.core.interfaces.ui.UiInteraction
 import app.aaps.core.interfaces.utils.HardLimits
@@ -27,42 +28,78 @@ import app.aaps.core.objects.extensions.put
 import app.aaps.core.objects.extensions.store
 import app.aaps.plugins.insulin.sipp.SentinelPkPdController
 import app.aaps.plugins.insulin.sipp.SippPrefs
+import io.reactivex.rxjava3.disposables.CompositeDisposable
 import org.json.JSONObject
 import java.util.Locale
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.math.floor
 import kotlin.math.roundToInt
 
 /**
  * Oref Free-Peak insulin with SIPP PK handoff (DIA/Peak),
- * SIPP Instant-ISF readout (RAW exp-TDD), and SIPP Basal / Max Basal readouts.
- * Adds SIPP activity-evidence readout (HR/SPM/sustain + ISF×, +Peak).
+ * live ISF readout, and live-derived Basal / Max Basal readouts.
+ * Sleep-aware DIA ceiling and Activity fusion (HR/SPM hints).
  */
 @Singleton
 class InsulinOrefFreePeakPlugin @Inject constructor(
     private val preferences: Preferences,
     rHelp: ResourceHelper,
     profFunc: ProfileFunction,
-    rxBus: RxBus,
+    rxBusParam: RxBus,
     aapsLogger: AAPSLogger,
     config: Config,
     hardLimits: HardLimits,
     uiInteraction: UiInteraction,
     private val sipp: SentinelPkPdController
 ) : InsulinOrefBasePlugin(
-    rHelp, profFunc, rxBus, aapsLogger, config, hardLimits, uiInteraction
+    rHelp, profFunc, rxBusParam, aapsLogger, config, hardLimits, uiInteraction
 ) {
 
     private companion object {
-        // Global guards
+
+        // Global caps (peak)
         private const val GLOBAL_PEAK_MIN_MIN = 45
         private const val GLOBAL_PEAK_MAX_DEFAULT = 210
-        private const val GLOBAL_PEAK_MAX_EXTENDED = 240  // when "Allow DIA > 9h" is enabled
+        private const val GLOBAL_PEAK_MAX_EXTENDED = 240
 
-        // Ramp anchors for the saturating cap
-        private const val RAMP_START_DIA_H = 6f   // start allowing peaks > 120 min
-        private const val RAMP_END_DIA_H = 12f   // reach the global max by 12h
-        private const val CAP_AT_6H_MIN = 120    // cap at 6h
+        // Ramp anchors for peak cap as DIA grows
+        private const val RAMP_START_DIA_H = 6f
+        private const val RAMP_END_DIA_H = 12f
+        private const val CAP_AT_6H_MIN = 120
+    }
+
+    // live row refs
+    private var sippDiaRowRef: Preference? = null
+    private var sippPeakRowRef: Preference? = null
+    private var sippIsfRowRef: Preference? = null
+    private var sippBasalRowRef: Preference? = null
+    private var sippMaxBasalRowRef: Preference? = null
+    private var sippDiagRowRef: Preference? = null
+    private var activityReadoutRef: Preference? = null
+    private var hrPrefRef: SwitchPreferenceCompat? = null
+    private var stepsPrefRef: SwitchPreferenceCompat? = null
+    private var sleepManualStartRef: EditTextPreference? = null
+    private var sleepManualEndRef: EditTextPreference? = null
+
+    private val busSubs = CompositeDisposable()
+
+    override fun onStart() {
+        super.onStart()
+        runCatching {
+            busSubs.add(
+                rxBus.toObservable(EventNewBG::class.java)
+                    .subscribe({ _: EventNewBG -> safeUiRefresh() }, { _: Throwable -> })
+            )
+            busSubs.add(
+                rxBus.toObservable(EventAPSCalculationFinished::class.java)
+                    .subscribe({ _: EventAPSCalculationFinished -> safeUiRefresh() }, { _: Throwable -> })
+            )
+        }
+    }
+
+    override fun onStop() {
+        super.onStop(); busSubs.clear()
     }
 
     override val id get(): Insulin.InsulinType = Insulin.InsulinType.OREF_FREE_PEAK
@@ -71,44 +108,79 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
     override fun configuration(): JSONObject =
         JSONObject()
             .put(IntKey.InsulinOrefPeak, preferences)
-            .put("SIPP_CONFIG", SippPrefs.packToJson()) // export SIPP block
+            .put("SIPP_CONFIG", SippPrefs.packToJson())
 
     override fun applyConfiguration(configuration: JSONObject) {
         configuration.store(IntKey.InsulinOrefPeak, preferences)
-        SippPrefs.applyFromJson(configuration.optJSONObject("SIPP_CONFIG")) // import SIPP block
+        SippPrefs.applyFromJson(configuration.optJSONObject("SIPP_CONFIG"))
     }
 
-    override fun commentStandardText(): String =
-        rh.gs(R.string.insulin_peak_time) + ": " + peak
+    override fun commentStandardText(): String = rh.gs(R.string.insulin_peak_time) + ": " + peak
 
-    /** DIA from SIPP when PK enabled; otherwise Profile DIA. */
+    // ---------- Sleep detection helpers ----------
+    private fun isManualSleepNow(nowMin: Int, startMin: Int, endMin: Int): Boolean {
+        return if (startMin <= endMin) {
+            nowMin in startMin..endMin
+        } else {
+            // window spans midnight
+            nowMin >= startMin || nowMin <= endMin
+        }
+    }
+
+    private fun nowMinutesSinceMidnight(): Int {
+        val now = System.currentTimeMillis()
+        val mins = (now / 60000L % (24 * 60)).toInt()
+        return if (mins < 0) mins + 24 * 60 else mins
+    }
+
+    private fun sleepActiveNow(): Boolean {
+        if (!SippPrefs.enableSleepRecovery()) return false
+        // Auto: rely on SIPP Activity fusion hints (no HR/cadence ⇒ likely rest)
+        val autoRest = if (SippPrefs.enableActivityFusion()) {
+            val snap = sipp.activitySnapshot()
+            (!snap.hrActive && !snap.cadenceActive)
+        } else false
+
+        // Manual window (for users without watch)
+        val manualOn = SippPrefs.manualSleepEnabled()
+        val manualNow = if (manualOn) {
+            val start = SippPrefs.manualSleepStartMin()
+            val end = SippPrefs.manualSleepEndMin()
+            val nowMin = nowMinutesSinceMidnight()
+            isManualSleepNow(nowMin, start, end)
+        } else false
+
+        return autoRest || manualNow
+    }
+
+    // ---------- DIA/peak exposure ----------
+    /** DIA from SIPP when PK enabled; otherwise Profile DIA. Sleep-aware ceiling, never shortened. */
     override val userDefinedDia: Double
         get() {
             val profileDia = profileFunction.getProfile()?.dia ?: hardLimits.minDia()
             if (!SippPrefs.enablePk()) return profileDia
+
             val persisted = SippPrefs.loadState()
             val diaH = (persisted?.diaH ?: sipp.current().diaH).toDouble()
-            val upper = if (SippPrefs.allowDiaAbove9h()) 24.0 else 9.0
+            val baseUpper = if (SippPrefs.allowDiaAbove9h()) 24.0 else 9.0
+            // During Sleep & Recovery we allow using the configured extended ceiling (does not force >9h by itself).
+            val upper = baseUpper
             return diaH.coerceIn(4.5, upper)
         }
 
-    /** Peak (minutes) from SIPP when PK enabled; otherwise preference. */
+    /** Peak (minutes) from SIPP when PK enabled; otherwise preference. Monotone with DIA. */
     override val peak: Int
         get() = if (SippPrefs.enablePk()) {
             val profMin = preferences.get(IntKey.InsulinOrefPeak)
             val persisted = SippPrefs.loadState()
 
-            // Current DIA in hours (same bounds we show to users)
-            val curDiaH = ((persisted?.diaH ?: sipp.current().diaH))
-                .coerceIn(4.5f, if (SippPrefs.allowDiaAbove9h()) 24f else 12f)
+            val diaUpper = if (SippPrefs.allowDiaAbove9h()) 24f else 12f
+            val curDiaH = (persisted?.diaH ?: sipp.current().diaH).coerceIn(4.5f, diaUpper)
 
-            // Proposed peak from source (persisted → live → pref)
             val fromSippMin = (persisted?.tPeakMin
                 ?: (sipp.current().peakH?.times(60f)?.roundToInt() ?: profMin))
 
-            // Saturating logical maximum for peak given current DIA
             val logicalMax = peakLogicalMax(curDiaH, SippPrefs.allowDiaAbove9h())
-
             fromSippMin.coerceIn(GLOBAL_PEAK_MIN_MIN, logicalMax)
         } else {
             preferences.get(IntKey.InsulinOrefPeak)
@@ -117,30 +189,23 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
     /** Monotone, saturating cap for peak time as DIA grows. */
     private fun peakLogicalMax(diaH: Float, allowExtended: Boolean): Int {
         val globalMax = if (allowExtended) GLOBAL_PEAK_MAX_EXTENDED else GLOBAL_PEAK_MAX_DEFAULT
-        val d = diaH
-
-        // Below ~6h: keep conservative cap (120 min)
-        if (d <= RAMP_START_DIA_H) return CAP_AT_6H_MIN.coerceAtMost(globalMax)
-
-        // Between 6h and 12h: linearly ramp 120 → globalMax
-        if (d < RAMP_END_DIA_H) {
-            val t = (d - RAMP_START_DIA_H) / (RAMP_END_DIA_H - RAMP_START_DIA_H) // 0..1
+        if (diaH <= RAMP_START_DIA_H) return CAP_AT_6H_MIN.coerceAtMost(globalMax)
+        if (diaH < RAMP_END_DIA_H) {
+            val t = (diaH - RAMP_START_DIA_H) / (RAMP_END_DIA_H - RAMP_START_DIA_H)
             val cap = (CAP_AT_6H_MIN + t * (globalMax - CAP_AT_6H_MIN)).roundToInt()
             return cap.coerceIn(GLOBAL_PEAK_MIN_MIN, globalMax)
         }
-
-        // ≥12h: freeze at global max (no more growth even if DIA is 20–24h)
         return globalMax
     }
 
-    // --------- helper: live SIPP readouts ----------
+    // ---------- Live readouts ----------
     private fun updateSippReadouts(
-        sippDiaRow: Preference,
-        sippPeakRow: Preference,
-        sippIsfRow: Preference,
-        sippBasalRow: Preference,
-        sippMaxBasalRow: Preference,
-        sippDiagRow: Preference
+        sippDiaRow: Preference?,
+        sippPeakRow: Preference?,
+        sippIsfRow: Preference?,
+        sippBasalRow: Preference?,
+        sippMaxBasalRow: Preference?,
+        sippDiagRow: Preference?
     ) {
         val prof = profileFunction.getProfile()
         val profDiaH = prof?.dia ?: hardLimits.minDia()
@@ -153,130 +218,119 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         val sippPkOn = SippPrefs.enablePk()
         val persisted = SippPrefs.loadState()
 
-        // DIA readout
-        if (sippPkOn) {
+        val sleepFlag = if (SippPrefs.enableSleepRecovery()) (if (sleepActiveNow()) " (sleep)" else " (awake)") else ""
+
+        // DIA
+        sippDiaRow?.summary = if (sippPkOn) {
             val diaUpper = if (SippPrefs.allowDiaAbove9h()) 24f else 12f
             val curDiaH = (persisted?.diaH ?: sipp.current().diaH).coerceIn(4.5f, diaUpper)
-            sippDiaRow.summary = String.format(
-                Locale.getDefault(),
-                "Instant (SIPP): %.2f h   |   Profile: %.2f h",
-                curDiaH,
-                profDiaH
-            )
+            String.format(Locale.getDefault(), "Instant (SIPP%s): %.2f h   |   Profile: %.2f h", sleepFlag, curDiaH, profDiaH)
         } else {
-            sippDiaRow.summary = String.format(
-                Locale.getDefault(),
-                "Instant (SIPP): —   |   Profile: %.2f h",
-                profDiaH
-            )
+            String.format(Locale.getDefault(), "Instant (SIPP): —   |   Profile: %.2f h", profDiaH)
         }
 
-        // Peak readout with saturating cap
-        if (sippPkOn) {
+        // Peak
+        sippPeakRow?.summary = if (sippPkOn) {
             val fromSippMin = (persisted?.tPeakMin
                 ?: (sipp.current().peakH?.times(60f)?.roundToInt() ?: profPeakMin))
             val curDiaForCap = (persisted?.diaH ?: sipp.current().diaH)
                 .coerceIn(4.5f, if (SippPrefs.allowDiaAbove9h()) 24f else 12f)
             val logicalMax = peakLogicalMax(curDiaForCap, SippPrefs.allowDiaAbove9h())
             val curPeakMin = fromSippMin.coerceIn(GLOBAL_PEAK_MIN_MIN, logicalMax)
-            sippPeakRow.summary =
-                "Instant (SIPP): $curPeakMin min   |   Profile: $profPeakMin min"
+            "Instant (SIPP$sleepFlag): $curPeakMin min   |   Profile: $profPeakMin min"
         } else {
-            sippPeakRow.summary = "Instant (SIPP): —   |   Profile: $profPeakMin min"
+            "Instant (SIPP): —   |   Profile: $profPeakMin min"
         }
 
-        // ISF readout = RAW instant SIPP ISF + Profile side-by-side + low-BG context hint
-        val rawIsfMgdl = SippPrefs.lastRawInstantIsfMgdl()
-        val (ctxBgMgdl, ctxLowMgdl) = SippPrefs.lastIsfContext()
-        val profileIsfDisplay = profIsfMgdl?.let { if (unitsMmol) it / 18.0 else it }
-        val profileIsfUnit = if (unitsMmol) "mmol/L/U" else "mg/dL/U"
+        // ISF
+        val usedIsfMgdl = SippPrefs.lastInstantIsfMgdl()
+        val displayUsed = usedIsfMgdl?.let { if (unitsMmol) it / 18.0 else it }
+        val displayUsedUnit = if (unitsMmol) "mmol/L/U" else "mg/dL/U"
+        val profileDisplay = profIsfMgdl?.let { if (unitsMmol) it / 18.0 else it }
+        val profileUnit = if (unitsMmol) "mmol/L/U" else "mg/dL/U"
 
-        val instantDisplay = rawIsfMgdl?.let { if (unitsMmol) it / 18.0 else it }
-        val unit = if (unitsMmol) "mmol/L/U" else "mg/dL/U"
-
-        sippIsfRow.summary = when {
-            instantDisplay != null && instantDisplay > 0.0 -> {
-                val left = String.format(
-                    Locale.getDefault(),
-                    "Instant (SIPP): %.2f %s",
-                    instantDisplay,
-                    unit
-                )
-                val right = if (profileIsfDisplay != null)
-                    String.format(
-                        Locale.getDefault(),
-                        " | Profile: %.2f %s",
-                        profileIsfDisplay,
-                        profileIsfUnit
-                    )
+        sippIsfRow?.summary = when {
+            displayUsed != null && displayUsed > 0.0 -> {
+                val left = String.format(Locale.getDefault(), "Instant (SIPP): %.2f %s", displayUsed, displayUsedUnit)
+                val right = if (profileDisplay != null)
+                    String.format(Locale.getDefault(), " | Profile: %.2f %s", profileDisplay, profileUnit)
                 else " | Profile: —"
-                val lowHint =
-                    if (ctxBgMgdl != null && ctxLowMgdl != null && ctxBgMgdl < ctxLowMgdl)
-                        "  • BG below target at last save: safety rails apply"
-                    else
-                        ""
-                left + right + lowHint
+                left + right
             }
-
             else -> {
-                if (profileIsfDisplay != null)
-                    String.format(
-                        Locale.getDefault(),
-                        "Instant (SIPP): — | Profile: %.2f %s",
-                        profileIsfDisplay,
-                        profileIsfUnit
-                    )
+                if (profileDisplay != null)
+                    String.format(Locale.getDefault(), "Instant (SIPP): — | Profile: %.2f %s", profileDisplay, profileUnit)
                 else
                     "Instant (SIPP): — | Profile: —"
             }
         }
 
-        // Basal readouts (U/h) — Instant and Max
-        val instBasal = if (SippPrefs.enableBasal()) SippPrefs.lastInstantBasalUph() else null
-        sippBasalRow.summary = when {
+        // Derived Instant Basal
+        val instBasal: Double? = runCatching {
+            if (!SippPrefs.enableBasal()) null
+            else {
+                val isfMgdl = usedIsfMgdl ?: return@runCatching null
+                if (isfMgdl <= 0.0) null
+                else {
+                    val tddEst = 1800.0 / isfMgdl
+                    round2(0.45 * tddEst / 24.0)
+                }
+            }
+        }.getOrNull()
+
+        sippBasalRow?.summary = when {
             instBasal != null && instBasal > 0.0 ->
-                String.format(
-                    Locale.getDefault(),
-                    "Instant (SIPP): %.2f U/h   |   Profile: %.2f U/h",
-                    instBasal,
-                    profBasalUph
-                )
+                String.format(Locale.getDefault(), "Derived (SIPP): %.2f U/h   |   Profile: %.2f U/h", instBasal, profBasalUph)
             else ->
-                String.format(
-                    Locale.getDefault(),
-                    "Instant (SIPP): —   |   Profile: %.2f U/h",
-                    profBasalUph
-                )
+                String.format(Locale.getDefault(), "Derived (SIPP): —   |   Profile: %.2f U/h", profBasalUph)
         }
 
-        val instMaxBasal =
-            if (SippPrefs.enableMaxBasal()) SippPrefs.lastMaxBasalUph() else null
-        sippMaxBasalRow.summary = when {
+        // Derived Max Basal (independent view)
+        val instMaxBasal: Double? = runCatching {
+            if (!SippPrefs.enableMaxBasal()) null
+            else {
+                val isfMgdl = usedIsfMgdl ?: return@runCatching null
+                if (isfMgdl <= 0.0 || prof == null) null
+                else {
+                    val tddEst = 1800.0 / isfMgdl
+                    val instantBasal = 0.45 * tddEst / 24.0
+                    val scheduled = prof.getBasal()
+                    val fromMultiplier = scheduled * 1.8
+                    val fromInstant = instantBasal * 3.0
+                    val fromDaily = prof.getMaxDailyBasal() * preferences.get(DoubleKey.ApsMaxDailyMultiplier)
+                    val maxOfCandidates = maxOf(fromMultiplier, fromInstant, fromDaily)
+                    round2(maxOfCandidates.coerceAtMost(hardLimits.maxBasal()))
+                }
+            }
+        }.getOrNull()
+
+        sippMaxBasalRow?.summary = when {
             instMaxBasal != null && instMaxBasal > 0.0 ->
-                String.format(
-                    Locale.getDefault(),
-                    "Instant (SIPP): %.2f U/h   |   Pref: %.2f U/h",
-                    instMaxBasal,
-                    prefMaxBasalUph
-                )
+                String.format(Locale.getDefault(), "Derived (SIPP): %.2f U/h   |   Pref: %.2f U/h", instMaxBasal, prefMaxBasalUph)
             else ->
-                String.format(
-                    Locale.getDefault(),
-                    "Instant (SIPP): —   |   Pref: %.2f U/h",
-                    prefMaxBasalUph
-                )
+                String.format(Locale.getDefault(), "Derived (SIPP): —   |   Pref: %.2f U/h", prefMaxBasalUph)
         }
 
-        // Diagnostics (Confidence | RMSE | Bias)
+        // Diagnostics
         runCatching {
             val d = sipp.diagnostics()
             val rmseStr = String.format(Locale.getDefault(), "%.0f", d.rmse)
             val biasStr = String.format(Locale.getDefault(), "%+.0f", d.bias)
             val confStr = String.format(Locale.getDefault(), "%.2f", d.confidence)
-            sippDiagRow.summary = "Confidence: $confStr  |  RMSE: $rmseStr  |  Bias: $biasStr"
+            sippDiagRow?.summary = "Confidence: $confStr  |  RMSE: $rmseStr  |  Bias: $biasStr"
         }.onFailure {
-            sippDiagRow.summary = "Confidence: —  |  RMSE: —  |  Bias: —"
+            sippDiagRow?.summary = "Confidence: —  |  RMSE: —  |  Bias: —"
         }
+    }
+
+    private fun round2(v: Double) = floor(v * 100.0 + 0.5) / 100.0
+
+    private fun safeUiRefresh() {
+        updateSippReadouts(
+            sippDiaRowRef, sippPeakRowRef, sippIsfRowRef, sippBasalRowRef, sippMaxBasalRowRef, sippDiagRowRef
+        )
+        updateActivityReadout()
+        updateSleepSummaries()
     }
 
     init {
@@ -294,43 +348,33 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         requiredKey: String?
     ) {
         if (requiredKey != null) return
-
-        // Initialize plugin-local prefs store
         SippPrefs.init(context)
 
-        // ===== Free-Peak section (collapsed) =====
+        // ===== Free-Peak section =====
         val fpCat = PreferenceCategory(context).apply {
             key = "insulin_free_peak_settings"
             title = rh.gs(R.string.insulin_oref_peak)
-            initialExpandedChildrenCount = 0 // collapsed → arrow to expand
+            initialExpandedChildrenCount = 0
         }
         parent.addPreference(fpCat)
         fpCat.addPreference(
             app.aaps.core.validators.preferences.AdaptiveIntPreference(
-                ctx = context,
-                intKey = IntKey.InsulinOrefPeak,
-                title = R.string.insulin_peak_time
+                ctx = context, intKey = IntKey.InsulinOrefPeak, title = R.string.insulin_peak_time
             )
         )
 
-        // ===== SIPP section (collapsed) =====
+        // ===== SIPP section =====
         val sippCategory = PreferenceCategory(context).also {
             it.key = "insulin_sipp_settings"
             it.title = "SIPP (Sentinel Instant PK/PD)"
-            it.initialExpandedChildrenCount = 0 // collapsed → arrow to expand
+            it.initialExpandedChildrenCount = 0
         }
         parent.addPreference(sippCategory)
 
-        // Insulin archetype selector for SIPP seeding
         val insulinTypePref = ListPreference(context).apply {
             key = "sipp_insulin_archetype"
             title = "Insulin archetype for SIPP seeding"
-            entries = arrayOf(
-                "AUTO (use current preset)",
-                "Rapid-acting (Humalog / NovoRapid)",
-                "Ultra-rapid (Fiasp)",
-                "Lyumjev"
-            )
+            entries = arrayOf("AUTO (use current preset)", "Rapid-acting (Humalog / NovoRapid)", "Ultra-rapid (Fiasp)", "Lyumjev")
             entryValues = arrayOf("AUTO", "RAPID", "FIASP", "LYUMJEV")
             val current = SippPrefs.insulinArchetype()
             value = if (entryValues.contains(current)) current else "AUTO"
@@ -340,114 +384,162 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
                 "LYUMJEV" -> "Current: Lyumjev"
                 else      -> "Current: AUTO (use current preset)"
             }
+            setOnPreferenceChangeListener { _, newValue ->
+                SippPrefs.setInsulinArchetype(newValue as String); true
+            }
         }
         sippCategory.addPreference(insulinTypePref)
 
-        // Master PK (Peak & DIA)
         val sippPk = SwitchPreferenceCompat(context).apply {
             key = "sipp_enable_pk"
             title = "Enable SIPP: PK (DIA & Peak)"
             summary = "Let SIPP auto-tune DIA/Peak with safety rails."
             isChecked = SippPrefs.enablePk()
+            setOnPreferenceChangeListener { _, newValue ->
+                SippPrefs.setEnablePk(newValue as Boolean)
+                safeUiRefresh()
+                true
+            }
         }
         sippCategory.addPreference(sippPk)
 
-        // ISF toggle (mutually exclusive with DS)
         val sippIsf = SwitchPreferenceCompat(context).apply {
             key = "sipp_enable_isf"
             title = "Enable SIPP: ISF"
-            summary =
-                "Uses Instant ISF (exp-weighted TDD). Turning ON will turn Dynamic Sensitivity OFF."
+            summary = "Uses Instant ISF (exp-weighted TDD). Turning ON will turn Dynamic Sensitivity OFF."
             isChecked = SippPrefs.enableIsf()
             isEnabled = SippPrefs.enablePk() && !preferences.get(BooleanKey.ApsUseDynamicSensitivity)
+            setOnPreferenceChangeListener { _, newValue ->
+                val on = newValue as Boolean
+                if (on && preferences.get(BooleanKey.ApsUseDynamicSensitivity)) {
+                    preferences.put(BooleanKey.ApsUseDynamicSensitivity, false)
+                }
+                SippPrefs.setEnableIsf(on)
+                safeUiRefresh()
+                true
+            }
         }
         sippCategory.addPreference(sippIsf)
 
-        // Expert: allow DIA > 9 h (up to 24 h)
         val sippDiaExpert = SwitchPreferenceCompat(context).apply {
             key = "sipp_allow_dia_above_9h"
             title = "Allow DIA > 9 h (expert)"
             summary = "Allows SIPP to extend DIA up to 24 h for slow sites/stacking."
             isChecked = SippPrefs.allowDiaAbove9h()
             isEnabled = SippPrefs.enablePk()
+            setOnPreferenceChangeListener { _, newValue ->
+                SippPrefs.setAllowDiaAbove9h(newValue as Boolean)
+                safeUiRefresh()
+                true
+            }
         }
         sippCategory.addPreference(sippDiaExpert)
 
-        // NEW: Apply SIPP Instant Basal
         val sippBasalToggle = SwitchPreferenceCompat(context).apply {
             key = "sipp_enable_basal"
             title = "Apply SIPP Instant Basal"
-            summary = "Use SIPP’s calculated basal (from Instant ISF) as the current basal input."
+            summary = "Use SIPP’s calculated basal (from Used ISF) as the current basal input."
             isChecked = SippPrefs.enableBasal()
             isEnabled = true
+            setOnPreferenceChangeListener { _, newValue ->
+                SippPrefs.setEnableBasal(newValue as Boolean)
+                safeUiRefresh()
+                true
+            }
         }
         sippCategory.addPreference(sippBasalToggle)
 
-        // NEW: Apply SIPP Max Temp Basal cap
         val sippMaxBasalToggle = SwitchPreferenceCompat(context).apply {
             key = "sipp_enable_max_basal"
             title = "Apply SIPP Max Temp Basal cap"
-            summary = "Limit temp basals to SIPP’s suggested maximum (Max U/h a Temp Basal can be set to)."
+            summary = "Limit temp basals to SIPP’s suggested maximum."
             isChecked = SippPrefs.enableMaxBasal()
             isEnabled = true
+            setOnPreferenceChangeListener { _, newValue ->
+                SippPrefs.setEnableMaxBasal(newValue as Boolean)
+                safeUiRefresh()
+                true
+            }
         }
         sippCategory.addPreference(sippMaxBasalToggle)
 
-        // Optional site inputs
-        val siteLocationPref = ListPreference(context).apply {
-            key = "sipp_site_location"
-            title = "Site Location"
-            entries = arrayOf("Abdomen", "Arm", "Thigh")
-            entryValues = arrayOf("ABDOMEN", "ARM", "THIGH")
-            val currentLoc = SippPrefs.siteLocation()
-            value = currentLoc
-            summary = "Current: $currentLoc"
+        // ===== Sleep & recovery (auto + manual window) =====
+        val sleepCat = PreferenceCategory(context).apply {
+            key = "sipp_sleep_recovery"
+            title = "SIPP – Sleep & recovery"
+            initialExpandedChildrenCount = 0
         }
-        sippCategory.addPreference(siteLocationPref)
+        parent.addPreference(sleepCat)
 
-        val siteAgeEnabledPref = SwitchPreferenceCompat(context).apply {
-            key = "sipp_site_age_enabled"
-            title = "Use Site Age Effect (advanced)"
-            summary =
-                "OFF recommended for Medtrum Nano. Enable only if you know age affects absorption."
-            isChecked = SippPrefs.siteAgeEnabled()
+        val sleepMaster = SwitchPreferenceCompat(context).apply {
+            key = "sipp_enable_sleep_recovery"
+            title = "Sleep-aware DIA ceiling"
+            summary = "Uses rest detection (no HR/steps) or your manual window; never shortens DIA."
+            isChecked = SippPrefs.enableSleepRecovery()
+            setOnPreferenceChangeListener { _, newValue ->
+                SippPrefs.setEnableSleepRecovery(newValue as Boolean)
+                updateSleepSummaries()
+                safeUiRefresh()
+                true
+            }
         }
-        sippCategory.addPreference(siteAgeEnabledPref)
+        sleepCat.addPreference(sleepMaster)
 
-        val siteAgePref = EditTextPreference(context).apply {
-            key = "sipp_site_age_h"
-            title = "Site Age (hours)"
-            dialogTitle = "Enter hours since insertion"
-            val currentAge = SippPrefs.siteAgeH()
-            text = currentAge
-            summary = "Current: $currentAge"
-            isEnabled = siteAgeEnabledPref.isChecked
-            setOnBindEditTextListener { it.inputType = InputType.TYPE_CLASS_NUMBER }
+        val sleepManual = SwitchPreferenceCompat(context).apply {
+            key = "sipp_manual_sleep_enabled"
+            title = "Use manual sleep window"
+            summary = "Enable manual time window for sleep if you don’t wear a watch."
+            isChecked = SippPrefs.manualSleepEnabled()
+            setOnPreferenceChangeListener { _, newValue ->
+                SippPrefs.setManualSleepEnabled(newValue as Boolean)
+                updateSleepSummaries()
+                safeUiRefresh()
+                true
+            }
         }
-        sippCategory.addPreference(siteAgePref)
+        sleepCat.addPreference(sleepManual)
 
-        // Readouts (non-clickable)
-        val sippDiaRow =
-            Preference(context).apply { key = "sipp_readout_dia"; title = "DIA"; isSelectable = false }
-        val sippPeakRow = Preference(context).apply {
-            key = "sipp_readout_peak"; title = "Peak Time"; isSelectable = false
+        val startPref = EditTextPreference(context).apply {
+            key = "sipp_manual_sleep_start"
+            title = "Manual sleep start (HH:MM)"
+            dialogTitle = "Enter start time (HH:MM, 24h)"
+            text = formatHm(SippPrefs.manualSleepStartMin())
+            summary = "Current: ${formatHm(SippPrefs.manualSleepStartMin())}"
+            setOnBindEditTextListener { it.inputType = InputType.TYPE_CLASS_TEXT }
+            setOnPreferenceChangeListener { _, newValue ->
+                val parsed = parseHm(newValue as String?) ?: return@setOnPreferenceChangeListener false
+                SippPrefs.setManualSleepStartMin(parsed)
+                summary = "Current: ${formatHm(parsed)}"
+                true
+            }
         }
-        val sippIsfRow =
-            Preference(context).apply { key = "sipp_readout_isf"; title = "ISF"; isSelectable = false }
-        val sippBasalRow = Preference(context).apply {
-            key = "sipp_readout_basal"; title = "Basal (U/h)"; isSelectable = false
+        sleepCat.addPreference(startPref)
+        sleepManualStartRef = startPref
+
+        val endPref = EditTextPreference(context).apply {
+            key = "sipp_manual_sleep_end"
+            title = "Manual sleep end (HH:MM)"
+            dialogTitle = "Enter end time (HH:MM, 24h)"
+            text = formatHm(SippPrefs.manualSleepEndMin())
+            summary = "Current: ${formatHm(SippPrefs.manualSleepEndMin())}"
+            setOnBindEditTextListener { it.inputType = InputType.TYPE_CLASS_TEXT }
+            setOnPreferenceChangeListener { _, newValue ->
+                val parsed = parseHm(newValue as String?) ?: return@setOnPreferenceChangeListener false
+                SippPrefs.setManualSleepEndMin(parsed)
+                summary = "Current: ${formatHm(parsed)}"
+                true
+            }
         }
-        val sippMaxBasalRow = Preference(context).apply {
-            key = "sipp_readout_max_basal"; title = "Max Basal (U/h)"; isSelectable = false
-        }
-        val sippDiagRow = Preference(context).apply {
-            key = "SIPP_readout_diag"; title = "Verification"; isSelectable = false
-        }
-        val sippRefresh = Preference(context).apply {
-            key = "SIPP_refresh"
-            title = "Refresh SIPP readouts"
-            summary = "Recalculate on the next BG tick and update the panel"
-        }
+        sleepCat.addPreference(endPref)
+        sleepManualEndRef = endPref
+
+        // ===== SIPP readouts =====
+        val sippDiaRow = Preference(context).apply { key = "sipp_readout_dia"; title = "DIA"; isSelectable = false }
+        val sippPeakRow = Preference(context).apply { key = "sipp_readout_peak"; title = "Peak Time"; isSelectable = false }
+        val sippIsfRow = Preference(context).apply { key = "sipp_readout_isf"; title = "ISF"; isSelectable = false }
+        val sippBasalRow = Preference(context).apply { key = "sipp_readout_basal"; title = "Basal (U/h)"; isSelectable = false }
+        val sippMaxBasalRow = Preference(context).apply { key = "sipp_readout_max_basal"; title = "Max Basal (U/h)"; isSelectable = false }
+        val sippDiagRow = Preference(context).apply { key = "SIPP_readout_diag"; title = "Verification"; isSelectable = false }
 
         sippCategory.addPreference(sippDiaRow)
         sippCategory.addPreference(sippPeakRow)
@@ -455,145 +547,31 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         sippCategory.addPreference(sippBasalRow)
         sippCategory.addPreference(sippMaxBasalRow)
         sippCategory.addPreference(sippDiagRow)
-        sippCategory.addPreference(sippRefresh)
 
-        // Listeners
-        insulinTypePref.setOnPreferenceChangeListener { pref, newValue ->
-            val v = newValue as String
-            SippPrefs.setInsulinArchetype(v)
-            pref.summary = when (v) {
-                "RAPID"   -> "Current: Rapid-acting (Humalog / NovoRapid)"
-                "FIASP"   -> "Current: Ultra-rapid (Fiasp)"
-                "LYUMJEV" -> "Current: Lyumjev"
-                else      -> "Current: AUTO (use current preset)"
-            }
-            true
-        }
+        sippDiaRowRef = sippDiaRow; sippPeakRowRef = sippPeakRow; sippIsfRowRef = sippIsfRow
+        sippBasalRowRef = sippBasalRow; sippMaxBasalRowRef = sippMaxBasalRow; sippDiagRowRef = sippDiagRow
 
-        sippPk.setOnPreferenceChangeListener { _, newValue ->
-            SippPrefs.setEnablePk(newValue as Boolean)
-            sippIsf.isEnabled = SippPrefs.enablePk() && !preferences.get(BooleanKey.ApsUseDynamicSensitivity)
-            sippDiaExpert.isEnabled = SippPrefs.enablePk()
-            updateSippReadouts(
-                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
-            )
-            updateActivityReadout()
-            true
-        }
-        sippIsf.setOnPreferenceChangeListener { _, newValue ->
-            val on = newValue as Boolean
-            if (on && preferences.get(BooleanKey.ApsUseDynamicSensitivity)) {
-                // Mutual exclusion: SIPP ISF ON forces DS OFF
-                preferences.put(BooleanKey.ApsUseDynamicSensitivity, false)
-            }
-            SippPrefs.setEnableIsf(on)
-            updateSippReadouts(
-                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
-            )
-            updateActivityReadout()
-            true
-        }
-        sippDiaExpert.setOnPreferenceChangeListener { _, newValue ->
-            SippPrefs.setAllowDiaAbove9h(newValue as Boolean)
-            updateSippReadouts(
-                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
-            )
-            updateActivityReadout()
-            true
-        }
+        updateSippReadouts(sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow)
 
-        // NEW: listeners for SIPP Basal toggles
-        sippBasalToggle.setOnPreferenceChangeListener { _, newValue ->
-            SippPrefs.setEnableBasal(newValue as Boolean)
-            updateSippReadouts(
-                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
-            )
-            updateActivityReadout()
-            true
-        }
-        sippMaxBasalToggle.setOnPreferenceChangeListener { _, newValue ->
-            SippPrefs.setEnableMaxBasal(newValue as Boolean)
-            updateSippReadouts(
-                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
-            )
-            updateActivityReadout()
-            true
-        }
-
-        siteLocationPref.setOnPreferenceChangeListener { pref, newValue ->
-            val v = newValue as String
-            SippPrefs.setSiteLocation(v)
-            pref.summary = "Current: $v"
-            updateSippReadouts(
-                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
-            )
-            updateActivityReadout()
-            true
-        }
-        siteAgeEnabledPref.setOnPreferenceChangeListener { _, newValue ->
-            val on = newValue as Boolean
-            SippPrefs.setSiteAgeEnabled(on)
-            siteAgePref.isEnabled = on
-            updateSippReadouts(
-                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
-            )
-            updateActivityReadout()
-            true
-        }
-        siteAgePref.setOnPreferenceChangeListener { pref, newValue ->
-            val v = (newValue as String).ifBlank { "1" }
-            SippPrefs.setSiteAgeH(v)
-            pref.summary = "Current: $v"
-            updateSippReadouts(
-                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
-            )
-            updateActivityReadout()
-            true
-        }
-
-        // Manual refresh triggers same pipeline as a BG tick, then refresh UI
-        sippRefresh.setOnPreferenceClickListener {
-            rxBus.send(EventNewBG(System.currentTimeMillis()))
-            updateSippReadouts(
-                sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
-            )
-            updateActivityReadout()
-            true
-        }
-
-        // Initial fill (will use persisted state if present)
-        updateSippReadouts(
-            sippDiaRow, sippPeakRow, sippIsfRow, sippBasalRow, sippMaxBasalRow, sippDiagRow
-        )
-
-        // ===== NEW: SIPP – Activity fusion UI (master + HR + Steps), collapsed =====
+        // ===== Activity fusion =====
         addSippActivityPrefs(parent, context)
+        updateSleepSummaries()
     }
 
     // ---------- SIPP Activity Fusion UI ----------
-    private var hrPrefRef: SwitchPreferenceCompat? = null
-    private var stepsPrefRef: SwitchPreferenceCompat? = null
-    private var activityReadoutRef: Preference? = null
-
-    private fun addSippActivityPrefs(
-        parent: PreferenceScreen,
-        context: Context
-    ) {
-        // Ensure prefs are ready
+    private fun addSippActivityPrefs(parent: PreferenceScreen, context: Context) {
         SippPrefs.init(context)
-
         val category = PreferenceCategory(context).apply {
             key = "sipp_activity_fusion"
             title = "SIPP – Activity fusion"
-            initialExpandedChildrenCount = 0 // collapsed by default (arrow visible)
+            initialExpandedChildrenCount = 0
         }
         parent.addPreference(category)
 
-        // Master toggle
         val master = SwitchPreferenceCompat(context).apply {
-            key = "sipp_enable_activity_fusion_ui" // UI key; real state in SippPrefs
+            key = "sipp_enable_activity_fusion_ui"
             title = "Use activity fusion (HR & steps)"
-            summary = "Small ISF weakening (+3–12%) and up to +10 min peak shift during sustained activity; DIA never shortened."
+            summary = "Small ISF weakening (+3–12%) and up to +10 min peak shift; DIA never shortened."
             isChecked = SippPrefs.enableActivityFusion()
             setOnPreferenceChangeListener { _, newValue ->
                 val on = newValue as Boolean
@@ -605,7 +583,6 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             }
         }
 
-        // Sub: Heart rate
         val hrPref = SwitchPreferenceCompat(context).apply {
             key = "sipp_use_hr_ui"
             title = "Use heart-rate"
@@ -619,11 +596,10 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             }
         }
 
-        // Sub: Steps / cadence
         val stepsPref = SwitchPreferenceCompat(context).apply {
             key = "sipp_use_steps_ui"
             title = "Use steps / cadence"
-            summary = "Active when ≥60 steps/min for ≥5 min (adds small ISF weakening; up to +10 min peak)."
+            summary = "Active when ≥60 steps/min for ≥5 min."
             isChecked = SippPrefs.useSteps()
             isEnabled = SippPrefs.enableActivityFusion()
             setOnPreferenceChangeListener { _, newValue ->
@@ -633,7 +609,6 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
             }
         }
 
-        // Readout: Activity evidence & applied effect
         val activityReadout = Preference(context).apply {
             key = "sipp_readout_activity"
             title = "Activity evidence"
@@ -649,42 +624,54 @@ class InsulinOrefFreePeakPlugin @Inject constructor(
         category.addPreference(stepsPref)
         category.addPreference(activityReadout)
 
-        // Initial fill of the activity readout
         updateActivityReadout()
     }
 
-    /** Builds a concise, single-line summary of HR/SPM evidence and tiny effects applied. */
     private fun updateActivityReadout() {
         val row = activityReadoutRef ?: return
         runCatching {
             val snap = sipp.activitySnapshot()
+            val fusionOn = SippPrefs.enableActivityFusion()
+            val hrToggleOn = SippPrefs.useHr()
+            val stepsToggleOn = SippPrefs.useSteps()
             val hr = snap.hrBpm?.toString() ?: "—"
             val spm = snap.stepsPerMin?.toString() ?: "—"
             val sustain = snap.sustainedActiveMin
-            val onOff = if (snap.fusionEnabled) "ON" else "OFF"
-
-            // Use toggles in the final string (no unused-variable warning)
-            val togglesStr = buildString {
-                append("hr="); append(if (snap.hrEnabled) "ON" else "OFF")
-                append(", steps="); append(if (snap.cadenceEnabled) "ON" else "OFF")
-            }
-
-            val actFlags = buildString {
-                val flags = mutableListOf<String>()
-                if (snap.hrActive) flags += "HR"
-                if (snap.cadenceActive) flags += "Steps"
-                if (snap.hintActive) flags += "Hint"
-                append(if (flags.isEmpty()) "—" else flags.joinToString("+"))
-            }
+            val flags = mutableListOf<String>()
+            if (snap.hrActive) flags += "HR"
+            if (snap.cadenceActive) flags += "Steps"
+            if (snap.hintActive) flags += "Hint"
+            val actFlags = if (flags.isEmpty()) "—" else flags.joinToString("+")
             val isfPct = ((snap.isfScaleApplied - 1.0f) * 100f)
             val isfStr = if (isfPct >= 0.05f) String.format(Locale.getDefault(), "+%.0f%%", isfPct) else "0%"
             val peakStr = if (snap.peakShiftMin > 0) "+${snap.peakShiftMin} min" else "0 min"
-
-            row.summary =
-                "Fusion: $onOff  |  Toggles: $togglesStr  |  HR: $hr bpm  |  SPM: $spm  |  Sustained: ${sustain}m  |  Active: $actFlags  |  ISF: $isfStr  |  Peak: $peakStr"
+            val togglesStr = "hr=" + (if (hrToggleOn) "ON" else "OFF") + ", steps=" + (if (stepsToggleOn) "ON" else "OFF")
+            row.summary = "Fusion: " + (if (fusionOn) "ON" else "OFF") +
+                "  |  Toggles: $togglesStr  |  HR: $hr bpm  |  SPM: $spm  |  Sustained: ${sustain}m  |  Active: $actFlags  |  ISF: $isfStr  |  Peak: $peakStr"
         }.onFailure {
-            row.summary =
-                "Fusion: —  |  Toggles: —  |  HR: —  |  SPM: —  |  Sustained: —  |  Active: —  |  ISF: —  |  Peak: —"
+            row.summary = "Fusion: —  |  Toggles: —  |  HR: —  |  SPM: —  |  Sustained: —  |  Active: —  |  ISF: —  |  Peak: —"
         }
+    }
+
+    // ---------- Sleep UI helpers ----------
+    private fun updateSleepSummaries() {
+        sleepManualStartRef?.summary = "Current: ${formatHm(SippPrefs.manualSleepStartMin())}"
+        sleepManualEndRef?.summary = "Current: ${formatHm(SippPrefs.manualSleepEndMin())}"
+    }
+
+    private fun parseHm(text: String?): Int? {
+        if (text.isNullOrBlank()) return null
+        val parts = text.trim().split(":")
+        if (parts.size != 2) return null
+        val h = parts[0].toIntOrNull() ?: return null
+        val m = parts[1].toIntOrNull() ?: return null
+        if (h !in 0..23 || m !in 0..59) return null
+        return h * 60 + m
+    }
+
+    private fun formatHm(minSinceMidnight: Int): String {
+        val h = (minSinceMidnight / 60) % 24
+        val m = minSinceMidnight % 60
+        return String.format(Locale.getDefault(), "%02d:%02d", h, m)
     }
 }

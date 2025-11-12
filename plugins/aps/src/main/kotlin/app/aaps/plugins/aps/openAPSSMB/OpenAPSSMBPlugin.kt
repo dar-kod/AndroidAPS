@@ -1,6 +1,5 @@
 package app.aaps.plugins.aps.openAPSSMB
 
-// === NEW imports for HR/Steps wiring ===
 import android.content.Context
 import android.content.Intent
 import androidx.collection.LongSparseArray
@@ -84,7 +83,6 @@ import javax.inject.Provider
 import javax.inject.Singleton
 import kotlin.math.abs
 import kotlin.math.floor
-import kotlin.math.max
 import kotlin.math.roundToInt
 
 @Singleton
@@ -127,7 +125,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
     loggerParam, rh
 ), APS, PluginConstraints {
 
-    // ===== Adaptive + safe clamp defaults =====
+    // ===== Adaptive + safety defaults =====
     private val bolusLookbackPerDiaFrac = 0.04
     private val bolusLookbackMin = 45
     private val bolusLookbackMax = 90
@@ -139,7 +137,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
     private val basalExcessRatio = 1.20
     private val suspendRecentMin = 15
 
-    // === NEW: wear subscriptions & simple dedupe for steps ===
+    // Wear subscriptions & dedupe for steps
     private val wearDisposables = CompositeDisposable()
     @Volatile private var lastStepIngestMin: Long = -1
 
@@ -157,50 +155,37 @@ open class OpenAPSSMBPlugin @Inject constructor(
         }
         aapsLogger.debug(LTag.APS, "Loaded $count variable sensitivity values from database")
 
-        // === NEW: Wire HR + Steps from Wear into SIPP ===
+        // Wire HR + Steps from Wear into SIPP
         runCatching {
-            // Heart Rate
             val hrSub = rxBus
                 .toObservable(EventData.ActionHeartRate::class.java)
                 .subscribe({ hrEvt ->
-                               // beatsPerMinute is Double in most builds; round & clamp to sane range
                                val bpm = hrEvt.beatsPerMinute.roundToInt().coerceIn(30, 220)
                                sentinelController.setHr(bpm)
                                aapsLogger.debug(LTag.APS, "SIPP HR wired: $bpm bpm @${hrEvt.timestamp}")
-                           }, { e ->
-                               aapsLogger.error(LTag.APS, "HR→SIPP subscription error", e)
-                           })
+                           }, { e -> aapsLogger.error(LTag.APS, "HR→SIPP subscription error", e) })
             wearDisposables.add(hrSub)
 
-            // Steps Rate (derive approx steps/min from the shortest non-zero window)
             val stepsSub = rxBus
                 .toObservable(EventData.ActionStepsRate::class.java)
                 .subscribe({ stEvt ->
                                val perMin = when {
-                                   stEvt.steps5min != 0  -> (stEvt.steps5min / 5).coerceAtLeast(0)
+                                   stEvt.steps5min != 0 -> (stEvt.steps5min / 5).coerceAtLeast(0)
                                    stEvt.steps10min != 0 -> (stEvt.steps10min / 10).coerceAtLeast(0)
                                    stEvt.steps15min != 0 -> (stEvt.steps15min / 15).coerceAtLeast(0)
-                                   else                  -> 0
+                                   else                 -> 0
                                }
                                if (perMin > 0) {
                                    val minuteTs = stEvt.timestamp / 60_000L
                                    if (minuteTs != lastStepIngestMin) {
-                                       // Feed the derived cadence as a single "step event" for this minute
                                        sentinelController.onStep(perMin, stEvt.timestamp)
                                        lastStepIngestMin = minuteTs
-                                       aapsLogger.debug(
-                                           LTag.APS,
-                                           "SIPP STEPS wired: ~${perMin} spm @${stEvt.timestamp}"
-                                       )
+                                       aapsLogger.debug(LTag.APS, "SIPP STEPS wired: ~${perMin} spm @${stEvt.timestamp}")
                                    }
                                }
-                           }, { e ->
-                               aapsLogger.error(LTag.APS, "STEPS→SIPP subscription error", e)
-                           })
+                           }, { e -> aapsLogger.error(LTag.APS, "STEPS→SIPP subscription error", e) })
             wearDisposables.add(stepsSub)
-        }.onFailure {
-            aapsLogger.error(LTag.APS, "Wear wiring start failed", it)
-        }
+        }.onFailure { aapsLogger.error(LTag.APS, "Wear wiring start failed", it) }
     }
 
     override fun onStop() {
@@ -225,8 +210,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 Notification.DYN_ISF_FALLBACK, start,
                 rh.gs(R.string.fallback_to_isf_no_tdd, sensitivity.first), Notification.INFO, dateUtil.now() + T.mins(1).msecs()
             )
-        else
-            uiInteraction.dismissNotification(Notification.DYN_ISF_FALLBACK)
+        else uiInteraction.dismissNotification(Notification.DYN_ISF_FALLBACK)
         profiler.log(
             LTag.APS,
             "getIsfMgdl() multiplier=$multiplier reason=${sensitivity.first} sensitivity=${sensitivity.second} caller=$caller",
@@ -246,41 +230,31 @@ open class OpenAPSSMBPlugin @Inject constructor(
             }
         }
         val sensitivity = if (count == 0) null else sum / count
-        aapsLogger.debug(
-            LTag.APS,
-            "getAverageIsfMgdl() $sensitivity from $count values ${dateUtil.dateAndTimeAndSecondsString(timestamp)} $caller"
-        )
+        aapsLogger.debug(LTag.APS, "getAverageIsfMgdl() $sensitivity from $count values ${dateUtil.dateAndTimeAndSecondsString(timestamp)} $caller")
         return sensitivity
     }
 
-    override fun specialEnableCondition(): Boolean {
-        return try {
-            activePlugin.activePump.pumpDescription.isTempBasalCapable
-        } catch (_: Exception) {
-            true
-        }
+    override fun specialEnableCondition(): Boolean = try {
+        activePlugin.activePump.pumpDescription.isTempBasalCapable
+    } catch (_: Exception) {
+        true
     }
 
-    override fun specialShowInListCondition(): Boolean {
-        return try {
-            activePlugin.activePump.pumpDescription.isTempBasalCapable
-        } catch (_: Exception) {
-            true
-        }
+    override fun specialShowInListCondition(): Boolean = try {
+        activePlugin.activePump.pumpDescription.isTempBasalCapable
+    } catch (_: Exception) {
+        true
     }
 
     override fun preprocessPreferences(preferenceFragment: PreferenceFragmentCompat) {
         super.preprocessPreferences(preferenceFragment)
-
         val smbEnabled = preferences.get(BooleanKey.ApsUseSmb)
         val smbAlwaysEnabled = preferences.get(BooleanKey.ApsUseSmbAlways)
         val uamEnabled = preferences.get(BooleanKey.ApsUseUam)
         val advancedFiltering = activePlugin.activeBgSource.advancedFilteringSupported()
         val autoSensOrDynIsfSensEnabled = if (preferences.get(BooleanKey.ApsUseDynamicSensitivity)) {
             preferences.get(BooleanKey.ApsDynIsfAdjustSensitivity)
-        } else {
-            preferences.get(BooleanKey.ApsUseAutosens)
-        }
+        } else preferences.get(BooleanKey.ApsUseAutosens)
 
         preferenceFragment.findPreference<SwitchPreference>(BooleanKey.ApsUseSmbAlways.key)?.isVisible =
             smbEnabled && advancedFiltering
@@ -295,13 +269,11 @@ open class OpenAPSSMBPlugin @Inject constructor(
         preferenceFragment.findPreference<SwitchPreference>(BooleanKey.ApsSensitivityRaisesTarget.key)?.isVisible =
             autoSensOrDynIsfSensEnabled
 
-        // Mutual exclusion in UI: turning DS ON forces SIPP-ISF OFF
+        // DS ON forces SIPP-ISF OFF
         preferenceFragment.findPreference<SwitchPreference>(BooleanKey.ApsUseDynamicSensitivity.key)
             ?.setOnPreferenceChangeListener { _, newValue ->
                 val on = newValue as Boolean
-                if (on && SippPrefs.enableIsf()) {
-                    SippPrefs.setEnableIsf(false)
-                }
+                if (on && SippPrefs.enableIsf()) SippPrefs.setEnableIsf(false)
                 true
             }
 
@@ -313,21 +285,16 @@ open class OpenAPSSMBPlugin @Inject constructor(
     private fun calculateVariableIsf(timestamp: Long, multiplier: Double): Pair<String, Double?> {
         if (!preferences.get(BooleanKey.ApsUseDynamicSensitivity)) return Pair("OFF", null)
 
-        // DB fast path for historical timestamps
         val result = persistenceLayer.getApsResultCloseTo(timestamp)
         if (result?.variableSens != null && result.variableSens != 0.0) {
             return Pair("DB", result.variableSens)
         }
 
-        // Cache fast path
         val glucose = glucoseStatusProvider.glucoseStatusData?.glucose ?: return Pair("GLUC", null)
         val key = timestamp - timestamp % T.mins(30).msecs() + glucose.toLong()
         val cached = dynIsfCache[key]
-        if (cached != null && timestamp < dateUtil.now()) {
-            return Pair("HIT", cached)
-        }
+        if (cached != null && timestamp < dateUtil.now()) return Pair("HIT", cached)
 
-        // Fresh compute
         val dynIsfResult = calculateRawDynIsf(multiplier)
         if (!dynIsfResult.tddPartsCalculated()) return Pair("TDD miss", null)
 
@@ -345,22 +312,17 @@ open class OpenAPSSMBPlugin @Inject constructor(
         var tdd: Double? = null
         var variableSensitivity: Double? = null
         var insulinDivisor: Int = 0
-
         var tddLast24HCarbs = 0.0
         var tdd7DDataCarbs = 0.0
         var tdd7DAllDaysHaveCarbs = false
-
         fun tddPartsCalculated() =
             tdd1D != null && tdd7D != null && tddLast24H != null && tddLast4H != null && tddLast8to4H != null
     }
 
-    /**
-     * Pure instant-ISF math (exp-like weights via coarse buckets) with EPS multiplier.
-     */
+    /** Pure instant-ISF math (exp-like weights via coarse buckets) with EPS multiplier. */
     private fun calculateRawDynIsf(multiplier: Double): DynIsfResult {
         val dyn = DynIsfResult()
 
-        // Legacy fields other code reads
         dyn.tdd1D = tddCalculator.averageTDD(tddCalculator.calculate(1, allowMissingDays = false))?.data?.totalAmount
         tddCalculator.averageTDD(tddCalculator.calculate(7, allowMissingDays = false))?.let {
             dyn.tdd7D = it.data.totalAmount
@@ -368,7 +330,6 @@ open class OpenAPSSMBPlugin @Inject constructor(
             dyn.tdd7DAllDaysHaveCarbs = it.allDaysHaveCarbs
         }
 
-        // Sliding last 24h (logging/visibility only)
         tddCalculator.calculateDaily(-24L, 0L)?.also {
             dyn.tddLast24H = it.totalAmount
             dyn.tddLast24HCarbs = it.carbs
@@ -396,32 +357,96 @@ open class OpenAPSSMBPlugin @Inject constructor(
 
         dyn.tdd = effectiveTdd
         dyn.variableSensitivity = Round.roundTo(1800.0 / effectiveTdd, 0.1) // mg/dL per U
-
         dyn.tddLast4H = amt0to4
         dyn.tddLast8to4H = amt4to12
-
         return dyn
     }
 
-    /**
-     * Compute & persist SIPP Instant Basal (U/h) and SIPP Max Basal (U/h) based on the ISF actually used.
-     */
-    private fun persistInstantAndMaxBasal(profile: Profile, sensMgdl: Double) {
+    /** Signals that ARW-MB uses to adapt Max Basal. */
+    private data class ArwSignals(
+        val bgNow: Double,
+        val deltaPerMin: Double,
+        val iobU: Double,
+        val minBg: Double,
+        val deliveredBasalNow: Double,
+        val recentSuspendMin: Int,
+        val flatBGs: Boolean,
+        val isTempTarget: Boolean
+    )
+
+    /** Compute & persist SIPP Instant Basal and ARW-MB Max Basal. */
+    private fun persistInstantAndMaxBasal(profile: Profile, sensMgdl: Double, sig: ArwSignals) {
         if (sensMgdl <= 0.0) return
         val tddEst = 1800.0 / sensMgdl
         val instantBasal = Round.roundTo(0.45 * tddEst / 24.0, 0.01)
 
-        val scheduled = profile.getBasal()
-        val fromMultiplier = scheduled * 1.8
-        val fromInstant = instantBasal * 3.0
-        val fromDaily = profile.getMaxDailyBasal() * preferences.get(DoubleKey.ApsMaxDailyMultiplier)
+        // ARW-MB risk mapping
+        val tddPerH = (tddEst / 24.0).coerceAtLeast(0.05)
+        val trendRisk = (abs(sig.deltaPerMin) / 2.0).coerceIn(0.0, 1.0)
+        val iobRisk = (sig.iobU / (2.0 * tddPerH)).coerceIn(0.0, 1.0)
+        val lowRisk = if (sig.bgNow < sig.minBg) 1.0 else 0.0
+        val suspendRisk = if (sig.recentSuspendMin in 1..suspendRecentMin) 1.0 else 0.0
+        val flatBonus = if (sig.flatBGs) -0.15 else 0.0
+        val ttBonus = if (sig.isTempTarget) 0.10 else 0.0
 
-        val unclampedMax = max(fromMultiplier, max(fromInstant, fromDaily))
-        val suggestedMax = Round.roundTo(unclampedMax.coerceAtMost(hardLimits.maxBasal()), 0.01)
+        val riskIndex = (0.45 * trendRisk +
+            0.35 * iobRisk +
+            0.15 * lowRisk +
+            0.05 * suspendRisk +
+            flatBonus + ttBonus).coerceIn(0.0, 1.0)
+
+        val minMult = 2.2
+        val maxMult = 3.8
+        val arwMult = (maxMult - (maxMult - minMult) * riskIndex)
+
+        val arwFromInstant = arwMult * instantBasal
+        val fromScheduled = 1.8 * profile.getBasal()
+        val fromDailyCap = profile.getMaxDailyBasal() * preferences.get(DoubleKey.ApsMaxDailyMultiplier)
+        val hardCeil = hardLimits.maxBasal()
+        val upperGuard = minOf(fromDailyCap, hardCeil)
+
+        val trio = doubleArrayOf(arwFromInstant, fromScheduled, upperGuard).sorted()
+        val physSuggested = trio[1]
+        val minFloor = (1.4 * instantBasal).coerceAtMost(upperGuard)
+
+        val suggestedMax = Round.roundTo(
+            physSuggested.coerceAtLeast(minFloor).coerceAtMost(upperGuard),
+            0.01
+        )
 
         val nowTs = dateUtil.now()
         runCatching { SippPrefs.saveLastInstantBasalUph(instantBasal, nowTs) }
         runCatching { SippPrefs.saveLastMaxBasalUph(suggestedMax, nowTs) }
+    }
+
+    /** First-time synthesis if user enabled SIPP basal/max but nothing persisted yet (prevents “—”). */
+    private fun synthesizeIfMissing(profile: Profile, usedIsfMgdl: Double, deliveredBasalNow: Double, minutesRunning: Int, minBg: Double, isTempTarget: Boolean) {
+        if (usedIsfMgdl <= 0.0) return
+        val haveBasal = (SippPrefs.lastInstantBasalUph() ?: 0.0) > 0.0
+        val haveMax = (SippPrefs.lastMaxBasalUph() ?: 0.0) > 0.0
+        if (haveBasal && haveMax) return
+        val gs = glucoseStatusProvider.glucoseStatusData
+        val dpm = try {
+            gs?.delta ?: 0.0
+        } catch (_: Throwable) {
+            0.0
+        }
+        val iobU = runCatching {
+            val autosensResult = AutosensResult()
+            iobCobCalculator.calculateIobArrayForSMB(autosensResult, false, SMBDefaults.half_basal_exercise_target, isTempTarget)
+                .lastOrNull()?.iob ?: 0.0
+        }.getOrDefault(0.0)
+        val sig = ArwSignals(
+            bgNow = gs?.glucose ?: 0.0,
+            deltaPerMin = dpm,
+            iobU = iobU,
+            minBg = minBg,
+            deliveredBasalNow = deliveredBasalNow,
+            recentSuspendMin = if (deliveredBasalNow == 0.0) minutesRunning else 0,
+            flatBGs = (bgQualityCheck.state == BgQualityCheck.State.FLAT),
+            isTempTarget = isTempTarget
+        )
+        persistInstantAndMaxBasal(profile, usedIsfMgdl, sig)
     }
 
     override fun invoke(initiator: String, tempBasalFallback: Boolean) {
@@ -453,41 +478,11 @@ open class OpenAPSSMBPlugin @Inject constructor(
         val profile = profileAny
         val inputConstraints = ConstraintObject(0.0, aapsLogger)
 
-        if (!hardLimits.checkHardLimits(
-                profile.dia,
-                app.aaps.core.ui.R.string.profile_dia,
-                hardLimits.minDia(),
-                hardLimits.maxDia()
-            )
-        ) return
-        if (!hardLimits.checkHardLimits(
-                profile.getIcTimeFromMidnight(MidnightUtils.secondsFromMidnight()),
-                app.aaps.core.ui.R.string.profile_carbs_ratio_value,
-                hardLimits.minIC(),
-                hardLimits.maxIC()
-            )
-        ) return
-        if (!hardLimits.checkHardLimits(
-                profile.getIsfMgdl("OpenAPSSMBPlugin"),
-                app.aaps.core.ui.R.string.profile_sensitivity_value,
-                HardLimits.MIN_ISF,
-                HardLimits.MAX_ISF
-            )
-        ) return
-        if (!hardLimits.checkHardLimits(
-                profile.getMaxDailyBasal(),
-                app.aaps.core.ui.R.string.profile_max_daily_basal_value,
-                0.02,
-                hardLimits.maxBasal()
-            )
-        ) return
-        if (!hardLimits.checkHardLimits(
-                pump.baseBasalRate,
-                app.aaps.core.ui.R.string.current_basal_value,
-                0.01,
-                hardLimits.maxBasal()
-            )
-        ) return
+        if (!hardLimits.checkHardLimits(profile.dia, app.aaps.core.ui.R.string.profile_dia, hardLimits.minDia(), hardLimits.maxDia())) return
+        if (!hardLimits.checkHardLimits(profile.getIcTimeFromMidnight(MidnightUtils.secondsFromMidnight()), app.aaps.core.ui.R.string.profile_carbs_ratio_value, hardLimits.minIC(), hardLimits.maxIC())) return
+        if (!hardLimits.checkHardLimits(profile.getIsfMgdl("OpenAPSSMBPlugin"), app.aaps.core.ui.R.string.profile_sensitivity_value, HardLimits.MIN_ISF, HardLimits.MAX_ISF)) return
+        if (!hardLimits.checkHardLimits(profile.getMaxDailyBasal(), app.aaps.core.ui.R.string.profile_max_daily_basal_value, 0.02, hardLimits.maxBasal())) return
+        if (!hardLimits.checkHardLimits(pump.baseBasalRate, app.aaps.core.ui.R.string.current_basal_value, 0.01, hardLimits.maxBasal())) return
 
         val dynIsfMode =
             preferences.get(BooleanKey.ApsUseDynamicSensitivity) && hardLimits.checkHardLimits(
@@ -499,7 +494,6 @@ open class OpenAPSSMBPlugin @Inject constructor(
         val smbEnabled = preferences.get(BooleanKey.ApsUseSmb)
         val advancedFiltering = constraintsChecker.isAdvancedFilteringEnabled().also { inputConstraints.copyReasons(it) }.value()
 
-        // ----- time + temp basal snapshot (define ONCE) -----
         val now = dateUtil.now()
         val tb = processedTbrEbData.getTempBasalIncludingConvertedExtended(now)
         val currentTemp = CurrentTemp(
@@ -507,46 +501,17 @@ open class OpenAPSSMBPlugin @Inject constructor(
             rate = tb?.convertedToAbsolute(now, profile) ?: 0.0,
             minutesrunning = tb?.getPassedDurationToTimeInMinutes(now)
         )
+        val scheduledBasal: Double = profile.getBasal()
 
-        var minBg = hardLimits.verifyHardLimits(
-            Round.roundTo(profile.getTargetLowMgdl(), 0.1),
-            app.aaps.core.ui.R.string.profile_low_target,
-            HardLimits.LIMIT_MIN_BG[0],
-            HardLimits.LIMIT_MIN_BG[1]
-        )
-        var maxBg = hardLimits.verifyHardLimits(
-            Round.roundTo(profile.getTargetHighMgdl(), 0.1),
-            app.aaps.core.ui.R.string.profile_high_target,
-            HardLimits.LIMIT_MAX_BG[0],
-            HardLimits.LIMIT_MAX_BG[1]
-        )
-        var targetBg = hardLimits.verifyHardLimits(
-            profile.getTargetMgdl(),
-            app.aaps.core.ui.R.string.temp_target_value,
-            HardLimits.LIMIT_TARGET_BG[0],
-            HardLimits.LIMIT_TARGET_BG[1]
-        )
+        var minBg = hardLimits.verifyHardLimits(Round.roundTo(profile.getTargetLowMgdl(), 0.1), app.aaps.core.ui.R.string.profile_low_target, HardLimits.LIMIT_MIN_BG[0], HardLimits.LIMIT_MIN_BG[1])
+        var maxBg = hardLimits.verifyHardLimits(Round.roundTo(profile.getTargetHighMgdl(), 0.1), app.aaps.core.ui.R.string.profile_high_target, HardLimits.LIMIT_MAX_BG[0], HardLimits.LIMIT_MAX_BG[1])
+        var targetBg = hardLimits.verifyHardLimits(profile.getTargetMgdl(), app.aaps.core.ui.R.string.temp_target_value, HardLimits.LIMIT_TARGET_BG[0], HardLimits.LIMIT_TARGET_BG[1])
         var isTempTarget = false
         persistenceLayer.getTemporaryTargetActiveAt(dateUtil.now())?.let { tempTarget ->
             isTempTarget = true
-            minBg = hardLimits.verifyHardLimits(
-                tempTarget.lowTarget,
-                app.aaps.core.ui.R.string.temp_target_low_target,
-                HardLimits.LIMIT_TEMP_MIN_BG[0],
-                HardLimits.LIMIT_TEMP_MIN_BG[1]
-            )
-            maxBg = hardLimits.verifyHardLimits(
-                tempTarget.highTarget,
-                app.aaps.core.ui.R.string.temp_target_high_target,
-                HardLimits.LIMIT_TEMP_MAX_BG[0],
-                HardLimits.LIMIT_TEMP_MAX_BG[1]
-            )
-            targetBg = hardLimits.verifyHardLimits(
-                tempTarget.target(),
-                app.aaps.core.ui.R.string.temp_target_value,
-                HardLimits.LIMIT_TEMP_TARGET_BG[0],
-                HardLimits.LIMIT_TEMP_TARGET_BG[1]
-            )
+            minBg = hardLimits.verifyHardLimits(tempTarget.lowTarget, app.aaps.core.ui.R.string.temp_target_low_target, HardLimits.LIMIT_TEMP_MIN_BG[0], HardLimits.LIMIT_TEMP_MIN_BG[1])
+            maxBg = hardLimits.verifyHardLimits(tempTarget.highTarget, app.aaps.core.ui.R.string.temp_target_high_target, HardLimits.LIMIT_TEMP_MAX_BG[0], HardLimits.LIMIT_TEMP_MAX_BG[1])
+            targetBg = hardLimits.verifyHardLimits(tempTarget.target(), app.aaps.core.ui.R.string.temp_target_value, HardLimits.LIMIT_TEMP_TARGET_BG[0], HardLimits.LIMIT_TEMP_TARGET_BG[1])
         }
 
         var autosensResult = AutosensResult()
@@ -557,33 +522,19 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 Notification.SMB_FALLBACK, dateUtil.now(),
                 rh.gs(R.string.fallback_smb_no_tdd), Notification.INFO, dateUtil.now() + T.mins(1).msecs()
             )
-            inputConstraints.copyReasons(
-                ConstraintObject(false, aapsLogger).also {
-                    it.set(false, rh.gs(R.string.fallback_smb_no_tdd), this)
-                }
-            )
+            inputConstraints.copyReasons(ConstraintObject(false, aapsLogger).also { it.set(false, rh.gs(R.string.fallback_smb_no_tdd), this) })
         } else if (dynIsfMode && dynIsfResult.tddPartsCalculated()) {
             uiInteraction.dismissNotification(Notification.SMB_FALLBACK)
             val tddRatio =
-                if (preferences.get(BooleanKey.ApsDynIsfAdjustSensitivity)) (dynIsfResult.tddLast24H!! / dynIsfResult.tdd7D!!.coerceAtLeast(
-                    0.1
-                )) else 1.0
+                if (preferences.get(BooleanKey.ApsDynIsfAdjustSensitivity)) (dynIsfResult.tddLast24H!! / dynIsfResult.tdd7D!!.coerceAtLeast(0.1)) else 1.0
             val carbsRatio =
-                if (preferences.get(BooleanKey.ApsDynIsfAdjustSensitivity)
-                    && dynIsfResult.tddLast24HCarbs != 0.0
-                    && dynIsfResult.tdd7DDataCarbs != 0.0
-                    && dynIsfResult.tdd7DAllDaysHaveCarbs
-                ) ((dynIsfResult.tddLast24HCarbs / dynIsfResult.tdd7DDataCarbs - 1.0) * 0.6) + 1.0
+                if (preferences.get(BooleanKey.ApsDynIsfAdjustSensitivity) && dynIsfResult.tddLast24HCarbs != 0.0 && dynIsfResult.tdd7DDataCarbs != 0.0 && dynIsfResult.tdd7DAllDaysHaveCarbs)
+                    ((dynIsfResult.tddLast24HCarbs / dynIsfResult.tdd7DDataCarbs - 1.0) * 0.6) + 1.0
                 else 1.0
-            autosensResult = AutosensResult(
-                ratio = tddRatio / carbsRatio,
-                ratioFromTdd = tddRatio,
-                ratioFromCarbs = carbsRatio
-            )
+            autosensResult = AutosensResult(ratio = tddRatio / carbsRatio, ratioFromTdd = tddRatio, ratioFromCarbs = carbsRatio)
         } else {
             if (constraintsChecker.isAutosensModeEnabled().value()) {
-                val autosensData =
-                    iobCobCalculator.getLastAutosensDataWithWaitForCalculationFinish("OpenAPSPlugin")
+                val autosensData = iobCobCalculator.getLastAutosensDataWithWaitForCalculationFinish("OpenAPSPlugin")
                 if (autosensData == null) {
                     rxBus.send(EventResetOpenAPSGui(rh.gs(R.string.openaps_no_as_data)))
                     return
@@ -601,8 +552,12 @@ open class OpenAPSSMBPlugin @Inject constructor(
         )
         val mealData = iobCobCalculator.getMealDataWithWaitingForCalculationFinish()
 
-        val dsOn = preferences.get(BooleanKey.ApsUseDynamicSensitivity)
-        if (dsOn && SippPrefs.enableIsf()) SippPrefs.setEnableIsf(false)
+        // SIPP-ISF over DS if SIPP-ISF ON
+        if (SippPrefs.enableIsf() && preferences.get(BooleanKey.ApsUseDynamicSensitivity)) {
+            preferences.put(BooleanKey.ApsUseDynamicSensitivity, false)
+            aapsLogger.debug(LTag.APS, "DS disabled automatically; SIPP-ISF has priority.")
+            rxBus.send(EventOpenAPSUpdateGui())
+        }
 
         // ===================== ADAPTIVE GATING (PK learning) =====================
         val reasons = mutableListOf<String>()
@@ -616,25 +571,15 @@ open class OpenAPSSMBPlugin @Inject constructor(
         val diaMin = (profile.dia * 60.0).toInt()
         val lookbackTarget = (bolusLookbackPerDiaFrac * diaMin).toInt()
         val bolusLookbackMinReq = lookbackTarget.coerceIn(bolusLookbackMin, bolusLookbackMax)
-        if (minutesSinceLastBolus < bolusLookbackMinReq) {
-            reasons += "bolus<${bolusLookbackMinReq}min (was ${minutesSinceLastBolus}min)"
-        }
+        if (minutesSinceLastBolus < bolusLookbackMinReq) reasons += "bolus<${bolusLookbackMinReq}min (was ${minutesSinceLastBolus}min)"
 
         val last1hIns = tddCalculator.calculateDaily(-1L, 0L)?.totalAmount ?: 0.0
-        val tdd7d =
-            tddCalculator.averageTDD(tddCalculator.calculate(7, allowMissingDays = false))?.data?.totalAmount
-                ?: 0.0
-        val per30uThresh =
-            (bolusSumPer30MinPerTdd * tdd7d).coerceIn(bolusSumPer30MinMin, bolusSumPer30MinMax)
-        if (last1hIns >= 2.0 * per30uThresh) {
-            reasons += "insulinLoad1h≥${"%.2f".format(2.0 * per30uThresh)}U (was ${"%.2f".format(last1hIns)}U)"
-        }
+        val tdd7d = tddCalculator.averageTDD(tddCalculator.calculate(7, allowMissingDays = false))?.data?.totalAmount ?: 0.0
+        val per30uThresh = (bolusSumPer30MinPerTdd * tdd7d).coerceIn(bolusSumPer30MinMin, bolusSumPer30MinMax)
+        if (last1hIns >= 2.0 * per30uThresh) reasons += "insulinLoad1h≥${"%.2f".format(2.0 * per30uThresh)}U (was ${"%.2f".format(last1hIns)}U)"
 
-        val scheduledBasal = profile.getBasal()
-        val deliveredBasalNow =
-            tb?.convertedToAbsolute(now, profile) ?: activePlugin.activePump.baseBasalRate
+        val deliveredBasalNow = tb?.convertedToAbsolute(now, profile) ?: activePlugin.activePump.baseBasalRate
         val minutesRunning = tb?.getPassedDurationToTimeInMinutes(now) ?: 0
-
         if (deliveredBasalNow >= basalExcessRatio * scheduledBasal) {
             reasons += "basal≥${(basalExcessRatio * 100).toInt()}% sched (rate=${"%.2f".format(deliveredBasalNow)}U/h, sched=${"%.2f".format(scheduledBasal)}U/h)"
         }
@@ -643,9 +588,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
         }
 
         val allowPkLearning = reasons.isEmpty()
-        if (!allowPkLearning) {
-            aapsLogger.debug(LTag.APS, "SIPP PK update gated: ${reasons.joinToString("; ")}")
-        }
+        if (!allowPkLearning) aapsLogger.debug(LTag.APS, "SIPP PK update gated: ${reasons.joinToString("; ")}")
         // ========================================================================
 
         if (allowPkLearning) {
@@ -660,26 +603,16 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 }
                 val bgPred = bgNow + 15.0 * deltaPerMin
 
-                // Real total IOB at "now" (fallback to 0 on any API mismatch)
                 val iobU = runCatching { iobArray.lastOrNull()?.iob ?: 0.0 }.getOrDefault(0.0)
-
                 val basalSuspendedMin = if (deliveredBasalNow == 0.0) minutesRunning else 0
-                val siteAgeHours =
-                    if (SippPrefs.siteAgeEnabled()) SippPrefs.siteAgeH().toDoubleOrNull() ?: 1.0 else 1.0
+                val siteAgeHours = if (SippPrefs.siteAgeEnabled()) SippPrefs.siteAgeH().toDoubleOrNull() ?: 1.0 else 1.0
                 val hrBpm: Int? = null
                 val inExercise: Boolean? = null
                 val sensorOk = true
 
-                // Optional: quick log for the “tail-low” signature (no behavior change here)
-                val tailLowCandidate =
-                    (abs(iobU) < 0.1) &&
-                        (minutesSinceLastBolus >= 90) &&
-                        (bgNow < minBg)
-                if (tailLowCandidate) {
-                    aapsLogger.debug(LTag.APS, "SIPP tail-low candidate: IOB≈0, no recent SMBs, BG<$minBg")
-                }
+                val tailLowCandidate = (abs(iobU) < 0.1) && (minutesSinceLastBolus >= 90) && (bgNow < minBg)
+                if (tailLowCandidate) aapsLogger.debug(LTag.APS, "SIPP tail-low candidate: IOB≈0, no recent SMBs, BG<$minBg")
 
-                // Base DIA/Peak for SIPP seeding, optionally overridden by SIPP insulin archetype.
                 val (baseDiaH, basePeakMin) = when (SippPrefs.insulinArchetype()) {
                     "RAPID"   -> 5.0f to 75
                     "FIASP"   -> 4.0f to 60
@@ -705,57 +638,69 @@ open class OpenAPSSMBPlugin @Inject constructor(
             }.onFailure { /* never let SIPP crash dosing */ }
         }
 
+        // -------- ISF selection (SIPP-first; then DS; else Profile) --------
         val baseIsfMgdl: Double = profile.getIsfMgdl("OpenAPSSMBPlugin")
-        val instantIsfMgdl: Double? = calculateVariableIsf(now, epsMultiplier).second
+        val dsPair = calculateVariableIsf(now, epsMultiplier)
+        val dsIsf: Double? = dsPair.second
+        val sippIsf: Double? = if (SippPrefs.enableIsf()) dynIsfResult.variableSensitivity else null
 
         val sensForJs: Double = when {
-            SippPrefs.enableIsf() && instantIsfMgdl != null && instantIsfMgdl > 0.0 -> instantIsfMgdl
-            preferences.get(BooleanKey.ApsUseDynamicSensitivity) && instantIsfMgdl != null && instantIsfMgdl > 0.0 -> instantIsfMgdl
-            else                                                                                                   -> baseIsfMgdl
+            SippPrefs.enableIsf() && sippIsf != null && sippIsf > 0.0                            -> sippIsf
+            preferences.get(BooleanKey.ApsUseDynamicSensitivity) && dsIsf != null && dsIsf > 0.0 -> dsIsf
+            else                                                                                 -> baseIsfMgdl
         }
 
-        // Persist ISF readouts (used and raw)
-        runCatching { SippPrefs.saveLastInstantIsfMgdl(sensForJs, now) }
-        runCatching {
-            val rawInstantIsfFromExp = dynIsfResult.variableSensitivity
-            if (rawInstantIsfFromExp != null && rawInstantIsfFromExp > 0.0) {
-                SippPrefs.saveLastRawInstantIsfMgdl(rawInstantIsfFromExp, now)
-            }
-        }
+        // Persist “instant used” ISF every run for UI
+        runCatching { SippPrefs.saveLastInstantIsfMgdl(sensForJs, now, glucoseStatus.glucose, profile.getTargetLowMgdl()) }
+        runCatching { if (dsIsf != null && dsIsf > 0.0) SippPrefs.saveLastRawInstantIsfMgdl(dsIsf, now) }
 
-        // Persist Instant Basal & Max Basal derived from the ISF actually used (with timestamp)
-        persistInstantAndMaxBasal(profile, sensForJs)
-
-        runCatching {
-            val unitsMmol = (profileFunction.getUnits() == GlucoseUnit.MMOL)
-            val shown = if (unitsMmol) sensForJs / 18.0 else sensForJs
-            val unit = if (unitsMmol) "mmol/L" else "mg/dL"
-            aapsLogger.debug(
-                "Instant ISF (used): %.2f %s per U  [source=%s]".format(
-                    shown,
-                    unit,
-                    when {
-                        SippPrefs.enableIsf() && instantIsfMgdl != null -> "SIPP"
-                        preferences.get(BooleanKey.ApsUseDynamicSensitivity) && instantIsfMgdl != null -> "DS"
-                        else                                                                           -> "Profile"
-                    }
-                )
+        // --------- FIRST-RUN SEED (prevents “—” on new phone) ----------
+        if ((SippPrefs.enableBasal() || SippPrefs.enableMaxBasal())) {
+            synthesizeIfMissing(
+                profile = profile,
+                usedIsfMgdl = sensForJs,
+                deliveredBasalNow = tb?.convertedToAbsolute(now, profile) ?: activePlugin.activePump.baseBasalRate,
+                minutesRunning = tb?.getPassedDurationToTimeInMinutes(now) ?: 0,
+                minBg = minBg,
+                isTempTarget = isTempTarget
             )
         }
+        // ---------------------------------------------------------------
 
-        // ==== Inject SIPP Instant Basal & Max Basal into the JS profile when toggles are ON ====
+        // ==== Inject SIPP Instant Basal & Max Basal into the JS profile (with decay if stale) ====
+        fun ageMin(ts: Long) = if (ts == 0L) 9999 else ((now - ts) / 60000L).toInt()
+
         val sippInstantBasal = if (SippPrefs.enableBasal()) SippPrefs.lastInstantBasalUph() else null
-        val currentBasalForJs = if (sippInstantBasal != null && sippInstantBasal > 0.0) {
-            sippInstantBasal.coerceAtMost(hardLimits.maxBasal())
-        } else {
-            activePlugin.activePump.baseBasalRate
+        val sippInstantBasalTs = SippPrefs.lastInstantBasalTsMs() ?: 0L
+        val basalAge = ageMin(sippInstantBasalTs)
+        val currentBasalForJs = when {
+            sippInstantBasal != null && sippInstantBasal > 0.0 && basalAge <= 15     ->
+                sippInstantBasal.coerceAtMost(hardLimits.maxBasal())
+
+            sippInstantBasal != null && sippInstantBasal > 0.0 && basalAge in 16..60 -> {
+                val frac = (basalAge - 15).toDouble() / (60 - 15).toDouble()
+                val decayed = sippInstantBasal + (profile.getBasal() - sippInstantBasal) * frac
+                decayed.coerceAtMost(hardLimits.maxBasal())
+            }
+
+            else                                                                     -> activePlugin.activePump.baseBasalRate
         }
 
         val sippMaxBasalForJs = if (SippPrefs.enableMaxBasal()) SippPrefs.lastMaxBasalUph() else null
-        val maxBasalForJs = if (sippMaxBasalForJs != null && sippMaxBasalForJs > 0.0) {
-            sippMaxBasalForJs.coerceAtMost(hardLimits.maxBasal())
-        } else {
-            constraintsChecker.getMaxBasalAllowed(profile).also { inputConstraints.copyReasons(it) }.value()
+        val sippMaxBasalTs = SippPrefs.lastMaxBasalTsMs() ?: 0L
+        val maxAge = ageMin(sippMaxBasalTs)
+        val constrainedMax = constraintsChecker.getMaxBasalAllowed(profile).also { inputConstraints.copyReasons(it) }.value()
+        val maxBasalForJs = when {
+            sippMaxBasalForJs != null && sippMaxBasalForJs > 0.0 && maxAge <= 15     ->
+                sippMaxBasalForJs.coerceAtMost(hardLimits.maxBasal())
+
+            sippMaxBasalForJs != null && sippMaxBasalForJs > 0.0 && maxAge in 16..60 -> {
+                val frac = (maxAge - 15).toDouble() / (60 - 15).toDouble()
+                val decayed = sippMaxBasalForJs + (constrainedMax - sippMaxBasalForJs) * frac
+                decayed.coerceAtMost(hardLimits.maxBasal())
+            }
+
+            else                                                                     -> constrainedMax
         }
 
         @Suppress("KotlinConstantConditions")
@@ -800,16 +745,15 @@ open class OpenAPSSMBPlugin @Inject constructor(
             temptargetSet = isTempTarget,
             autosens_max = preferences.get(DoubleKey.AutosensMax),
             out_units = if (profileFunction.getUnits() == GlucoseUnit.MMOL) "mmol/L" else "mg/dl",
-            variable_sens = if (preferences.get(BooleanKey.ApsUseDynamicSensitivity)) (instantIsfMgdl ?: 0.0) else 0.0,
+            variable_sens = if (preferences.get(BooleanKey.ApsUseDynamicSensitivity)) (dsIsf ?: 0.0) else 0.0,
             insulinDivisor = 0,
             TDD = calculateVariableIsf(now, epsMultiplier).second?.let { 1800.0 / it } ?: (dynIsfResult.tdd ?: 0.0)
         )
 
         val microBolusAllowed =
-            constraintsChecker.isSMBModeEnabled(ConstraintObject(tempBasalFallback.not(), aapsLogger)).also {
-                inputConstraints.copyReasons(it)
-            }.value()
-        val flatBGsDetected = bgQualityCheck.state == BgQualityCheck.State.FLAT
+            constraintsChecker.isSMBModeEnabled(ConstraintObject(tempBasalFallback.not(), aapsLogger)).also { inputConstraints.copyReasons(it) }.value()
+
+        val flatBGsDetected = (bgQualityCheck.state == BgQualityCheck.State.FLAT)
 
         aapsLogger.debug(LTag.APS, ">>> Invoking determine_basal SMB <<<")
         aapsLogger.debug(LTag.APS, "Glucose status:     $glucoseStatus")
@@ -862,16 +806,8 @@ open class OpenAPSSMBPlugin @Inject constructor(
     override fun applyMaxIOBConstraints(maxIob: Constraint<Double>): Constraint<Double> {
         if (isEnabled()) {
             val maxIobPref = preferences.get(DoubleKey.ApsSmbMaxIob)
-            maxIob.setIfSmaller(
-                maxIobPref,
-                rh.gs(R.string.limiting_iob, maxIobPref, rh.gs(R.string.maxvalueinpreferences)),
-                this
-            )
-            maxIob.setIfSmaller(
-                hardLimits.maxIobSMB(),
-                rh.gs(R.string.limiting_iob, hardLimits.maxIobSMB(), rh.gs(R.string.hardlimit)),
-                this
-            )
+            maxIob.setIfSmaller(maxIobPref, rh.gs(R.string.limiting_iob, maxIobPref, rh.gs(R.string.maxvalueinpreferences)), this)
+            maxIob.setIfSmaller(hardLimits.maxIobSMB(), rh.gs(R.string.limiting_iob, hardLimits.maxIobSMB(), rh.gs(R.string.hardlimit)), this)
         }
         return maxIob
     }
@@ -883,44 +819,20 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 maxBasal = profile.getMaxDailyBasal()
                 absoluteRate.addReason(rh.gs(R.string.increasing_max_basal), this)
             }
-            absoluteRate.setIfSmaller(
-                maxBasal,
-                rh.gs(
-                    app.aaps.core.ui.R.string.limitingbasalratio,
-                    maxBasal,
-                    rh.gs(R.string.maxvalueinpreferences)
-                ),
-                this
-            )
+            absoluteRate.setIfSmaller(maxBasal, rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxBasal, rh.gs(R.string.maxvalueinpreferences)), this)
 
             val maxBasalMultiplier = preferences.get(DoubleKey.ApsMaxCurrentBasalMultiplier)
             val maxFromBasalMultiplier = floor(maxBasalMultiplier * profile.getBasal() * 100) / 100
-            absoluteRate.setIfSmaller(
-                maxFromBasalMultiplier,
-                rh.gs(
-                    app.aaps.core.ui.R.string.limitingbasalratio,
-                    maxFromBasalMultiplier,
-                    rh.gs(R.string.max_basal_multiplier)
-                ),
-                this
-            )
+            absoluteRate.setIfSmaller(maxFromBasalMultiplier, rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxFromBasalMultiplier, rh.gs(R.string.max_basal_multiplier)), this)
+
             val maxBasalFromDaily = preferences.get(DoubleKey.ApsMaxDailyMultiplier)
             val maxFromDaily = floor(profile.getMaxDailyBasal() * maxBasalFromDaily * 100) / 100
-            absoluteRate.setIfSmaller(
-                maxFromDaily,
-                rh.gs(
-                    app.aaps.core.ui.R.string.limitingbasalratio,
-                    maxFromDaily,
-                    rh.gs(R.string.max_daily_basal_multiplier)
-                ),
-                this
-            )
+            absoluteRate.setIfSmaller(maxFromDaily, rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxFromDaily, rh.gs(R.string.max_daily_basal_multiplier)), this)
 
-            // NEW: apply SIPP Max Basal if enabled and available
+            // Apply SIPP Max Basal if enabled and available
             val sippMaxBasal = if (SippPrefs.enableMaxBasal()) SippPrefs.lastMaxBasalUph() else null
             if (sippMaxBasal != null && sippMaxBasal > 0.0) {
-                val msg = "Limiting basal by SIPP Max Basal (" +
-                    String.format(Locale.getDefault(), "%.2f", sippMaxBasal) + " U/h)"
+                val msg = "Limiting basal by SIPP Max Basal (" + String.format(Locale.getDefault(), "%.2f", sippMaxBasal) + " U/h)"
                 absoluteRate.setIfSmaller(sippMaxBasal, msg, this)
             }
         }
