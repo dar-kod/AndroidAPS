@@ -5,37 +5,86 @@ import android.content.SharedPreferences
 import androidx.core.content.edit
 import androidx.preference.PreferenceManager
 import org.json.JSONObject
+import java.lang.ref.WeakReference
 
 /**
  * SIPP local preferences & lightweight state.
- * Initialize once via SippPrefs.init(context) before use.
+ * Safe under early access (init races) and corrupted-type keys.
+ * Always returns benign defaults; never throws from getters.
  */
 object SippPrefs {
 
     @Volatile private var sp: SharedPreferences? = null
+    @Volatile private var appContextRef: WeakReference<Context>? = null
+
+    @JvmStatic
     fun init(context: Context) {
+        appContextRef = WeakReference(context.applicationContext)
         if (sp == null) {
             synchronized(this) {
-                if (sp == null) sp = PreferenceManager.getDefaultSharedPreferences(context.applicationContext)
+                if (sp == null) {
+                    sp = PreferenceManager.getDefaultSharedPreferences(context.applicationContext)
+                }
             }
         }
     }
 
-    // ===== Feature flags =====
-    private const val K_ENABLE_PK = "SIPP_enable_pk"                 // DIA/Peak autotune
-    private const val K_ENABLE_ISF = "SIPP_enable_isf"               // Instant ISF
+    /** Obtain a ready SP; if not ready, try self-init; else use benign no-op prefs to avoid crashes. */
+    private fun requireReady(): SharedPreferences {
+        sp?.let { return it }
+        appContextRef?.get()?.let { ctx ->
+            init(ctx)
+            sp?.let { return it }
+        }
+        return EmptyPreferences
+    }
+
+    /** Defaults-only SharedPreferences that never throws (used during rare early races). */
+    private object EmptyPreferences : SharedPreferences {
+
+        override fun getAll(): MutableMap<String, Any?> = mutableMapOf()
+        override fun getString(key: String?, defValue: String?): String? = defValue
+        override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? = defValues
+        override fun getInt(key: String?, defValue: Int): Int = defValue
+        override fun getLong(key: String?, defValue: Long): Long = defValue
+        override fun getFloat(key: String?, defValue: Float): Float = defValue
+        override fun getBoolean(key: String?, defValue: Boolean): Boolean = defValue
+        override fun contains(key: String?): Boolean = false
+        override fun edit(): SharedPreferences.Editor = EmptyEditor
+        override fun registerOnSharedPreferenceChangeListener(l: SharedPreferences.OnSharedPreferenceChangeListener?) {}
+        override fun unregisterOnSharedPreferenceChangeListener(l: SharedPreferences.OnSharedPreferenceChangeListener?) {}
+
+        private object EmptyEditor : SharedPreferences.Editor {
+
+            override fun putString(key: String?, value: String?): SharedPreferences.Editor = this
+            override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor = this
+            override fun putInt(key: String?, value: Int): SharedPreferences.Editor = this
+            override fun putLong(key: String?, value: Long): SharedPreferences.Editor = this
+            override fun putFloat(key: String?, value: Float): SharedPreferences.Editor = this
+            override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor = this
+            override fun remove(key: String?): SharedPreferences.Editor = this
+            override fun clear(): SharedPreferences.Editor = this
+            override fun commit(): Boolean = true
+            override fun apply() {}
+        }
+    }
+
+    // ===== Keys =====
+    // Feature flags
+    private const val K_ENABLE_PK = "SIPP_enable_pk"
+    private const val K_ENABLE_ISF = "SIPP_enable_isf"
     private const val K_ALLOW_DIA_ABOVE_9H = "SIPP_allow_dia_above_9h"
 
     // Basal derivations
-    private const val K_ENABLE_BASAL = "SIPP_enable_basal"           // Apply Instant Basal
-    private const val K_ENABLE_MAX_BASAL = "SIPP_enable_max_basal"   // Apply Max Temp Basal cap
+    private const val K_ENABLE_BASAL = "SIPP_enable_basal"
+    private const val K_ENABLE_MAX_BASAL = "SIPP_enable_max_basal"
 
     // Site context
     private const val K_SITE_LOCATION = "SIPP_site_location"         // "ABDOMEN"|"ARM"|"THIGH"
     private const val K_SITE_AGE_ENABLED = "SIPP_site_age_enabled"
-    private const val K_SITE_AGE_H = "SIPP_site_age_h"               // string hours
+    private const val K_SITE_AGE_H = "SIPP_site_age_h"
 
-    // Insulin archetype seeding
+    // Insulin archetype
     private const val K_INSULIN_ARCHETYPE = "SIPP_insulin_archetype" // "AUTO"|"RAPID"|"FIASP"|"LYUMJEV"
 
     // Activity fusion
@@ -61,7 +110,7 @@ object SippPrefs {
     private const val K_LAST_ISF_BG_MGDL = "SIPP_last_isf_bg_mgdl"
     private const val K_LAST_ISF_TARGETLOW_MGDL = "SIPP_last_isf_targetlow_mgdl"
 
-    // ISF (raw alternative for diagnostics)
+    // ISF raw (diagnostic)
     private const val K_LAST_ISF_RAW_MGDL = "SIPP_last_isf_raw_mgdl"
     private const val K_LAST_ISF_RAW_TS = "SIPP_last_isf_raw_ts"
 
@@ -71,87 +120,117 @@ object SippPrefs {
     private const val K_LAST_MAX_BASAL_UPH = "SIPP_last_max_basal_uph"
     private const val K_LAST_MAX_BASAL_TS = "SIPP_last_max_basal_ts"
 
-    // Last activity samples (optional; used in UI/state replay)
+    // Activity snapshots (optional)
     private const val K_LAST_HR_BPM = "SIPP_last_hr_bpm"
     private const val K_LAST_HR_TS = "SIPP_last_hr_ts"
     private const val K_LAST_SPM = "SIPP_last_steps_per_min"
     private const val K_LAST_SUSTAIN_MIN = "SIPP_last_activity_window_min"
     private const val K_LAST_STEPS_TS = "SIPP_last_steps_ts"
 
-    // ===== Primitive helpers =====
-    private fun p(): SharedPreferences = requireNotNull(sp) { "SippPrefs.init(context) not called" }
-    private fun getBool(k: String, def: Boolean = false) = p().getBoolean(k, def)
+    // ===== Primitive helpers (safe; class-cast guarded) =====
+    private fun p(): SharedPreferences = requireReady()
+
+    private fun safeGetBoolean(k: String, def: Boolean = false): Boolean =
+        try {
+            p().getBoolean(k, def)
+        } catch (_: ClassCastException) {
+            p().edit { remove(k) }; def
+        }
+
+    private fun safeGetString(k: String, def: String): String =
+        try {
+            p().getString(k, def) ?: def
+        } catch (_: ClassCastException) {
+            p().edit { remove(k) }; def
+        }
+
+    private fun safeGetFloatOrNull(k: String): Float? =
+        try {
+            if (p().contains(k)) p().getFloat(k, 0f) else null
+        } catch (_: ClassCastException) {
+            p().edit { remove(k) }; null
+        }
+
+    private fun safeGetLongOrNull(k: String): Long? =
+        try {
+            if (p().contains(k)) p().getLong(k, 0L) else null
+        } catch (_: ClassCastException) {
+            p().edit { remove(k) }; null
+        }
+
+    private fun safeGetIntOrNull(k: String): Int? =
+        try {
+            if (p().contains(k)) p().getInt(k, 0) else null
+        } catch (_: ClassCastException) {
+            p().edit { remove(k) }; null
+        }
+
     private fun setBool(k: String, v: Boolean) = p().edit { putBoolean(k, v) }
-    private fun getString(k: String, def: String) = p().getString(k, def) ?: def
     private fun setString(k: String, v: String) = p().edit { putString(k, v) }
-    private fun getFloatOrNull(k: String): Float? = if (p().contains(k)) p().getFloat(k, 0f) else null
-    private fun getLongOrNull(k: String): Long? = if (p().contains(k)) p().getLong(k, 0L) else null
-    private fun getIntOrNull(k: String): Int? = if (p().contains(k)) p().getInt(k, 0) else null
 
     // ===== Feature toggles =====
-    fun enablePk() = getBool(K_ENABLE_PK)
+    fun enablePk() = safeGetBoolean(K_ENABLE_PK)
     fun setEnablePk(v: Boolean) = setBool(K_ENABLE_PK, v)
 
-    fun enableIsf() = getBool(K_ENABLE_ISF)
+    fun enableIsf() = safeGetBoolean(K_ENABLE_ISF)
     fun setEnableIsf(v: Boolean) = setBool(K_ENABLE_ISF, v)
 
-    fun allowDiaAbove9h() = getBool(K_ALLOW_DIA_ABOVE_9H)
+    fun allowDiaAbove9h() = safeGetBoolean(K_ALLOW_DIA_ABOVE_9H)
     fun setAllowDiaAbove9h(v: Boolean) = setBool(K_ALLOW_DIA_ABOVE_9H, v)
 
-    fun enableBasal() = getBool(K_ENABLE_BASAL)
+    fun enableBasal() = safeGetBoolean(K_ENABLE_BASAL)
     fun setEnableBasal(v: Boolean) = setBool(K_ENABLE_BASAL, v)
 
-    fun enableMaxBasal() = getBool(K_ENABLE_MAX_BASAL)
+    fun enableMaxBasal() = safeGetBoolean(K_ENABLE_MAX_BASAL)
     fun setEnableMaxBasal(v: Boolean) = setBool(K_ENABLE_MAX_BASAL, v)
 
     // Activity fusion
-    fun enableActivityFusion() = getBool(K_ENABLE_ACTIVITY)
+    fun enableActivityFusion() = safeGetBoolean(K_ENABLE_ACTIVITY)
     fun setEnableActivityFusion(v: Boolean) = setBool(K_ENABLE_ACTIVITY, v)
 
-    fun useHr() = getBool(K_USE_HR)
+    fun useHr() = safeGetBoolean(K_USE_HR)
     fun setUseHr(v: Boolean) = setBool(K_USE_HR, v)
 
-    fun useSteps() = getBool(K_USE_STEPS)
+    fun useSteps() = safeGetBoolean(K_USE_STEPS)
     fun setUseSteps(v: Boolean) = setBool(K_USE_STEPS, v)
 
-    // Sleep & recovery (auto/manual window)
-    fun enableSleepRecovery() = getBool(K_ENABLE_SLEEP_RECOVERY)
+    // Sleep & recovery
+    fun enableSleepRecovery() = safeGetBoolean(K_ENABLE_SLEEP_RECOVERY)
     fun setEnableSleepRecovery(v: Boolean) = setBool(K_ENABLE_SLEEP_RECOVERY, v)
 
-    fun manualSleepEnabled() = getBool(K_MANUAL_SLEEP_ENABLED)
+    fun manualSleepEnabled() = safeGetBoolean(K_MANUAL_SLEEP_ENABLED)
     fun setManualSleepEnabled(v: Boolean) = setBool(K_MANUAL_SLEEP_ENABLED, v)
 
-    fun manualSleepStartMin(): Int = getIntOrNull(K_MANUAL_SLEEP_START_MIN) ?: (23 * 60) // default 23:00
+    fun manualSleepStartMin(): Int = safeGetIntOrNull(K_MANUAL_SLEEP_START_MIN) ?: (23 * 60) // 23:00
     fun setManualSleepStartMin(minSinceMidnight: Int) =
         p().edit { putInt(K_MANUAL_SLEEP_START_MIN, minSinceMidnight.coerceIn(0, 1439)) }
 
-    fun manualSleepEndMin(): Int = getIntOrNull(K_MANUAL_SLEEP_END_MIN) ?: (7 * 60) // default 07:00
+    fun manualSleepEndMin(): Int = safeGetIntOrNull(K_MANUAL_SLEEP_END_MIN) ?: (7 * 60) // 07:00
     fun setManualSleepEndMin(minSinceMidnight: Int) =
         p().edit { putInt(K_MANUAL_SLEEP_END_MIN, minSinceMidnight.coerceIn(0, 1439)) }
 
     // Site context
-    fun siteLocation(): String = getString(K_SITE_LOCATION, "ABDOMEN")
+    fun siteLocation(): String = safeGetString(K_SITE_LOCATION, "ABDOMEN")
     fun setSiteLocation(v: String) = setString(K_SITE_LOCATION, v)
 
-    fun siteAgeEnabled() = getBool(K_SITE_AGE_ENABLED)
+    fun siteAgeEnabled() = safeGetBoolean(K_SITE_AGE_ENABLED)
     fun setSiteAgeEnabled(v: Boolean) = setBool(K_SITE_AGE_ENABLED, v)
 
-    fun siteAgeH(): String = getString(K_SITE_AGE_H, "1")
+    fun siteAgeH(): String = safeGetString(K_SITE_AGE_H, "1")
     fun setSiteAgeH(v: String) = setString(K_SITE_AGE_H, v)
 
     // Insulin archetype
-    fun insulinArchetype(): String = getString(K_INSULIN_ARCHETYPE, "AUTO")
+    fun insulinArchetype(): String = safeGetString(K_INSULIN_ARCHETYPE, "AUTO")
     fun setInsulinArchetype(v: String) = setString(K_INSULIN_ARCHETYPE, v)
 
     // ===== Live PK/PD state =====
     data class SavedState(val diaH: Float, val tPeakMin: Int, val isfMult: Float, val savedAtMs: Long)
 
     fun loadState(): SavedState? {
-        if (!p().contains(K_STATE_DIA_H) || !p().contains(K_STATE_TPEAK_MIN) || !p().contains(K_STATE_ISF_MULT)) return null
-        val dia = p().getFloat(K_STATE_DIA_H, 9.0f)
-        val tp = p().getInt(K_STATE_TPEAK_MIN, 120)
-        val im = p().getFloat(K_STATE_ISF_MULT, 1.0f)
-        val ts = p().getLong(K_STATE_TS_MS, 0L)
+        val dia = safeGetFloatOrNull(K_STATE_DIA_H) ?: return null
+        val tp = safeGetIntOrNull(K_STATE_TPEAK_MIN) ?: return null
+        val im = safeGetFloatOrNull(K_STATE_ISF_MULT) ?: return null
+        val ts = safeGetLongOrNull(K_STATE_TS_MS) ?: 0L
         return SavedState(dia, tp, im, ts)
     }
 
@@ -174,11 +253,11 @@ object SippPrefs {
         }
     }
 
-    fun lastInstantIsfMgdl(): Double? = getFloatOrNull(K_LAST_ISF_USED_MGDL)?.toDouble()
-    fun lastInstantIsfTsMs(): Long? = getLongOrNull(K_LAST_ISF_USED_TS)
+    fun lastInstantIsfMgdl(): Double? = safeGetFloatOrNull(K_LAST_ISF_USED_MGDL)?.toDouble()
+    fun lastInstantIsfTsMs(): Long? = safeGetLongOrNull(K_LAST_ISF_USED_TS)
     fun lastIsfContext(): Pair<Double?, Double?> {
-        val bg = getFloatOrNull(K_LAST_ISF_BG_MGDL)?.toDouble()
-        val low = getFloatOrNull(K_LAST_ISF_TARGETLOW_MGDL)?.toDouble()
+        val bg = safeGetFloatOrNull(K_LAST_ISF_BG_MGDL)?.toDouble()
+        val low = safeGetFloatOrNull(K_LAST_ISF_TARGETLOW_MGDL)?.toDouble()
         return Pair(bg, low)
     }
 
@@ -189,9 +268,8 @@ object SippPrefs {
             putLong(K_LAST_ISF_RAW_TS, tsMs)
         }
     }
-
-    fun lastRawInstantIsfMgdl(): Double? = getFloatOrNull(K_LAST_ISF_RAW_MGDL)?.toDouble()
-    fun lastRawInstantIsfTsMs(): Long? = getLongOrNull(K_LAST_ISF_RAW_TS)
+    fun lastRawInstantIsfMgdl(): Double? = safeGetFloatOrNull(K_LAST_ISF_RAW_MGDL)?.toDouble()
+    fun lastRawInstantIsfTsMs(): Long? = safeGetLongOrNull(K_LAST_ISF_RAW_TS)
 
     // ===== Basal suggestions =====
     fun saveLastInstantBasalUph(uph: Double, tsMs: Long) {
@@ -200,8 +278,8 @@ object SippPrefs {
             putLong(K_LAST_INST_BASAL_TS, tsMs)
         }
     }
-    fun lastInstantBasalUph(): Double? = getFloatOrNull(K_LAST_INST_BASAL_UPH)?.toDouble()
-    fun lastInstantBasalTsMs(): Long? = getLongOrNull(K_LAST_INST_BASAL_TS)
+    fun lastInstantBasalUph(): Double? = safeGetFloatOrNull(K_LAST_INST_BASAL_UPH)?.toDouble()
+    fun lastInstantBasalTsMs(): Long? = safeGetLongOrNull(K_LAST_INST_BASAL_TS)
 
     fun saveLastMaxBasalUph(uph: Double, tsMs: Long) {
         p().edit {
@@ -209,18 +287,18 @@ object SippPrefs {
             putLong(K_LAST_MAX_BASAL_TS, tsMs)
         }
     }
-    fun lastMaxBasalUph(): Double? = getFloatOrNull(K_LAST_MAX_BASAL_UPH)?.toDouble()
-    fun lastMaxBasalTsMs(): Long? = getLongOrNull(K_LAST_MAX_BASAL_TS)
+    fun lastMaxBasalUph(): Double? = safeGetFloatOrNull(K_LAST_MAX_BASAL_UPH)?.toDouble()
+    fun lastMaxBasalTsMs(): Long? = safeGetLongOrNull(K_LAST_MAX_BASAL_TS)
 
-    // ===== Activity snapshots (optional UI/state replay) =====
+    // ===== Activity snapshots =====
     fun saveLastHrBpm(bpm: Int?, tsMs: Long) {
         p().edit {
             if (bpm == null) remove(K_LAST_HR_BPM) else putInt(K_LAST_HR_BPM, bpm)
             putLong(K_LAST_HR_TS, tsMs)
         }
     }
-    fun lastHrBpm(): Int? = getIntOrNull(K_LAST_HR_BPM)
-    fun lastHrTsMs(): Long? = getLongOrNull(K_LAST_HR_TS)
+    fun lastHrBpm(): Int? = safeGetIntOrNull(K_LAST_HR_BPM)
+    fun lastHrTsMs(): Long? = safeGetLongOrNull(K_LAST_HR_TS)
 
     fun saveLastCadence(spm: Int?, sustainedActiveMin: Int, tsMs: Long) {
         p().edit {
@@ -229,9 +307,9 @@ object SippPrefs {
             putLong(K_LAST_STEPS_TS, tsMs)
         }
     }
-    fun lastStepsPerMin(): Int? = getIntOrNull(K_LAST_SPM)
-    fun lastSustainedActiveMin(): Int = getIntOrNull(K_LAST_SUSTAIN_MIN) ?: 0
-    fun lastStepsTsMs(): Long? = getLongOrNull(K_LAST_STEPS_TS)
+    fun lastStepsPerMin(): Int? = safeGetIntOrNull(K_LAST_SPM)
+    fun lastSustainedActiveMin(): Int = safeGetIntOrNull(K_LAST_SUSTAIN_MIN) ?: 0
+    fun lastStepsTsMs(): Long? = safeGetLongOrNull(K_LAST_STEPS_TS)
 
     // ===== Export / Import =====
     fun packToJson(): JSONObject = JSONObject().apply {
@@ -329,6 +407,7 @@ object SippPrefs {
         if (!used.isNaN() && usedTs != 0L) {
             saveLastInstantIsfMgdl(used, usedTs, if (bg.isNaN()) null else bg, if (low.isNaN()) null else low)
         }
+
         val raw = obj.optDouble("last_isf_raw_mgdl", Double.NaN)
         val rawTs = obj.optLong("last_isf_raw_ts", 0L)
         if (!raw.isNaN() && rawTs != 0L) saveLastRawInstantIsfMgdl(raw, rawTs)
@@ -337,6 +416,7 @@ object SippPrefs {
         val instBasal = obj.optDouble("last_instant_basal_uph", Double.NaN)
         val instTs = obj.optLong("last_instant_basal_ts", 0L)
         if (!instBasal.isNaN() && instTs != 0L) saveLastInstantBasalUph(instBasal, instTs)
+
         val maxBasal = obj.optDouble("last_max_basal_uph", Double.NaN)
         val maxTs = obj.optLong("last_max_basal_ts", 0L)
         if (!maxBasal.isNaN() && maxTs != 0L) saveLastMaxBasalUph(maxBasal, maxTs)
@@ -345,6 +425,7 @@ object SippPrefs {
         val hrBpm = obj.optInt("last_hr_bpm", Int.MIN_VALUE)
         val hrTs = obj.optLong("last_hr_ts", 0L)
         if (hrTs != 0L) saveLastHrBpm(if (hrBpm == Int.MIN_VALUE) null else hrBpm, hrTs)
+
         val spm = obj.optInt("last_spm", Int.MIN_VALUE)
         val sustain = obj.optInt("last_sustain_min", lastSustainedActiveMin())
         val stepsTs = obj.optLong("last_steps_ts", 0L)
