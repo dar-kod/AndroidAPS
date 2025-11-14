@@ -173,7 +173,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
                                    stEvt.steps5min != 0 -> (stEvt.steps5min / 5).coerceAtLeast(0)
                                    stEvt.steps10min != 0 -> (stEvt.steps10min / 10).coerceAtLeast(0)
                                    stEvt.steps15min != 0 -> (stEvt.steps15min / 15).coerceAtLeast(0)
-                                   else                 -> 0
+                                   else -> 0
                                }
                                if (perMin > 0) {
                                    val minuteTs = stEvt.timestamp / 60_000L
@@ -420,7 +420,14 @@ open class OpenAPSSMBPlugin @Inject constructor(
     }
 
     /** First-time synthesis if user enabled SIPP basal/max but nothing persisted yet (prevents “—”). */
-    private fun synthesizeIfMissing(profile: Profile, usedIsfMgdl: Double, deliveredBasalNow: Double, minutesRunning: Int, minBg: Double, isTempTarget: Boolean) {
+    private fun synthesizeIfMissing(
+        profile: Profile,
+        usedIsfMgdl: Double,
+        deliveredBasalNow: Double,
+        minutesRunning: Int,
+        minBg: Double,
+        isTempTarget: Boolean
+    ) {
         if (usedIsfMgdl <= 0.0) return
         val haveBasal = (SippPrefs.lastInstantBasalUph() ?: 0.0) > 0.0
         val haveMax = (SippPrefs.lastMaxBasalUph() ?: 0.0) > 0.0
@@ -674,7 +681,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
         val sippInstantBasalTs = SippPrefs.lastInstantBasalTsMs() ?: 0L
         val basalAge = ageMin(sippInstantBasalTs)
         val currentBasalForJs = when {
-            sippInstantBasal != null && sippInstantBasal > 0.0 && basalAge <= 15     ->
+            sippInstantBasal != null && sippInstantBasal > 0.0 && basalAge <= 15 ->
                 sippInstantBasal.coerceAtMost(hardLimits.maxBasal())
 
             sippInstantBasal != null && sippInstantBasal > 0.0 && basalAge in 16..60 -> {
@@ -683,7 +690,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 decayed.coerceAtMost(hardLimits.maxBasal())
             }
 
-            else                                                                     -> activePlugin.activePump.baseBasalRate
+            else                                                                 -> activePlugin.activePump.baseBasalRate
         }
 
         val sippMaxBasalForJs = if (SippPrefs.enableMaxBasal()) SippPrefs.lastMaxBasalUph() else null
@@ -691,7 +698,7 @@ open class OpenAPSSMBPlugin @Inject constructor(
         val maxAge = ageMin(sippMaxBasalTs)
         val constrainedMax = constraintsChecker.getMaxBasalAllowed(profile).also { inputConstraints.copyReasons(it) }.value()
         val maxBasalForJs = when {
-            sippMaxBasalForJs != null && sippMaxBasalForJs > 0.0 && maxAge <= 15     ->
+            sippMaxBasalForJs != null && sippMaxBasalForJs > 0.0 && maxAge <= 15 ->
                 sippMaxBasalForJs.coerceAtMost(hardLimits.maxBasal())
 
             sippMaxBasalForJs != null && sippMaxBasalForJs > 0.0 && maxAge in 16..60 -> {
@@ -700,8 +707,24 @@ open class OpenAPSSMBPlugin @Inject constructor(
                 decayed.coerceAtMost(hardLimits.maxBasal())
             }
 
-            else                                                                     -> constrainedMax
+            else                                                                 -> constrainedMax
         }
+
+        // ---------- SIPP EFFECTIVE DIAGNOSTIC LOG ----------
+        runCatching {
+            val unitsMmol = (profileFunction.getUnits() == GlucoseUnit.MMOL)
+            val shownIsf = if (unitsMmol) sensForJs / 18.0 else sensForJs
+            aapsLogger.debug(
+                LTag.APS,
+                "SIPP effective — ISF=%.2f%s, Basal(used)=%.2f U/h, MaxBasal(used)=%.2f U/h, Ages: basal=%d min, max=%d min".format(
+                    shownIsf, if (unitsMmol) " mmol/L/U" else " mg/dL/U",
+                    Round.roundTo(currentBasalForJs, 0.01),
+                    Round.roundTo(maxBasalForJs, 0.01),
+                    basalAge, maxAge
+                )
+            )
+        }
+        // ---------------------------------------------------
 
         @Suppress("KotlinConstantConditions")
         val oapsProfile = OapsProfile(
@@ -766,6 +789,37 @@ open class OpenAPSSMBPlugin @Inject constructor(
         aapsLogger.debug(LTag.APS, "flatBGsDetected:    $flatBGsDetected")
         aapsLogger.debug(LTag.APS, "DynIsfMode:         ${preferences.get(BooleanKey.ApsUseDynamicSensitivity)}")
 
+        // ---- SIPP banner (inside Constraints; shown at the top) ----
+        runCatching {
+            val prof = profile
+            val unitsMmol = (profileFunction.getUnits() == GlucoseUnit.MMOL)
+
+            // ISF actually used by SMB (already chosen earlier as sensForJs)
+            val shownIsf = if (unitsMmol) sensForJs / 18.0 else sensForJs
+            val isfUnit = if (unitsMmol) "mmol/L/U" else "mg/dL/U"
+
+            // What JS profile is using now (already decayed if stale)
+            val effBasal = currentBasalForJs
+
+            // Use the exact same effective max basal as constraints (no 0.01 drift)
+            val effMaxBasal = effectiveSippMaxBasalForConstraints(prof) ?: maxBasalForJs
+
+            // DIA & Peak (prefer SIPP persisted state; fall back to Profile/Pref)
+            val persisted = SippPrefs.loadState()
+            val profDiaH = prof.dia
+            val profPeakMin = preferences.get(IntKey.InsulinOrefPeak)
+            val diaH: Double = persisted?.diaH?.toDouble() ?: profDiaH
+            val peakMin: Int = persisted?.tPeakMin ?: profPeakMin
+
+            val banner = ConstraintObject(0.0, aapsLogger).apply {
+                addReason(
+                    "SIPP \u2192 DIA: ${fmt2(diaH)} h  |  Peak Time: $peakMin min  |  ISF: ${fmt2(shownIsf)} $isfUnit  |  Basal (used): ${fmt2(effBasal)} U/h  |  Max Basal (used): ${fmt2(effMaxBasal)} U/h",
+                    this@OpenAPSSMBPlugin
+                )
+            }
+            inputConstraints.copyReasons(banner)
+        }.onFailure { /* non-fatal */ }
+
         determineBasalSMB.determine_basal(
             glucose_status = glucoseStatus,
             currenttemp = currentTemp,
@@ -812,6 +866,38 @@ open class OpenAPSSMBPlugin @Inject constructor(
         return maxIob
     }
 
+    /** Round to 0.01 and format as 2-dec string (locale-aware). */
+    private fun fmt2(v: Double): String =
+        String.format(Locale.getDefault(), "%.2f", Round.roundTo(v, 0.01))
+
+    /** Compute effective SIPP Max Basal without calling ConstraintsChecker (to avoid recursion). */
+    private fun effectiveSippMaxBasalForConstraints(profile: Profile): Double? {
+        if (!SippPrefs.enableMaxBasal()) return null
+        val suggested = SippPrefs.lastMaxBasalUph() ?: return null
+        val ts = SippPrefs.lastMaxBasalTsMs() ?: return null
+
+        val now = dateUtil.now()
+        val ageMin = if (ts == 0L) 9_999 else ((now - ts) / 60_000L).toInt()
+
+        // Guard only by profile+hard; avoid constraintsChecker to prevent feedback loops
+        val upperGuard = minOf(
+            profile.getMaxDailyBasal() * preferences.get(DoubleKey.ApsMaxDailyMultiplier),
+            hardLimits.maxBasal()
+        )
+
+        val eff = when {
+            ageMin <= 15     -> suggested
+
+            ageMin in 16..60 -> {
+                val frac = (ageMin - 15).toDouble() / (60 - 15).toDouble()
+                suggested + (upperGuard - suggested) * frac
+            }
+
+            else             -> upperGuard
+        }
+        return Round.roundTo(eff.coerceAtMost(hardLimits.maxBasal()), 0.01)
+    }
+
     override fun applyBasalConstraints(absoluteRate: Constraint<Double>, profile: Profile): Constraint<Double> {
         if (isEnabled()) {
             var maxBasal = preferences.get(DoubleKey.ApsMaxBasal)
@@ -829,11 +915,10 @@ open class OpenAPSSMBPlugin @Inject constructor(
             val maxFromDaily = floor(profile.getMaxDailyBasal() * maxBasalFromDaily * 100) / 100
             absoluteRate.setIfSmaller(maxFromDaily, rh.gs(app.aaps.core.ui.R.string.limitingbasalratio, maxFromDaily, rh.gs(R.string.max_daily_basal_multiplier)), this)
 
-            // Apply SIPP Max Basal if enabled and available
-            val sippMaxBasal = if (SippPrefs.enableMaxBasal()) SippPrefs.lastMaxBasalUph() else null
-            if (sippMaxBasal != null && sippMaxBasal > 0.0) {
-                val msg = "Limiting basal by SIPP Max Basal (" + String.format(Locale.getDefault(), "%.2f", sippMaxBasal) + " U/h)"
-                absoluteRate.setIfSmaller(sippMaxBasal, msg, this)
+            // Apply SIPP Max Basal (effective/decayed to align with UI & dosing)
+            effectiveSippMaxBasalForConstraints(profile)?.let { eff ->
+                val msg = "Limiting basal by SIPP Max Basal (" + String.format(Locale.getDefault(), "%.2f", eff) + " U/h)"
+                absoluteRate.setIfSmaller(eff, msg, this)
             }
         }
         return absoluteRate
