@@ -10,12 +10,10 @@ import android.net.Uri
  * Runs before any Activity/Service/Receiver, so SIPP is ready for plugins.
  */
 class SippPrefsInitProvider : ContentProvider() {
-
     override fun onCreate(): Boolean {
         context?.applicationContext?.let { SippPrefs.init(it) }
         return true
     }
-
     override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor? = null
     override fun getType(uri: Uri): String? = null
     override fun insert(uri: Uri, values: ContentValues?): Uri? = null
