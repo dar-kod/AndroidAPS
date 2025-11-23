@@ -9,7 +9,6 @@ import java.lang.ref.WeakReference
 
 /**
  * SIPP local preferences & lightweight state.
- * Safe under early access (init races) and corrupted-type keys.
  * Always returns benign defaults; never throws from getters.
  */
 object SippPrefs {
@@ -29,7 +28,7 @@ object SippPrefs {
         }
     }
 
-    /** Obtain a ready SP; if not ready, try self-init; else use benign no-op prefs to avoid crashes. */
+    /** Obtain a ready SP or a benign stub (never crashes). */
     private fun requireReady(): SharedPreferences {
         sp?.let { return it }
         appContextRef?.get()?.let { ctx ->
@@ -39,9 +38,8 @@ object SippPrefs {
         return EmptyPreferences
     }
 
-    /** Defaults-only SharedPreferences that never throws (used during rare early races). */
+    /** Defaults-only SharedPreferences that never throws. */
     private object EmptyPreferences : SharedPreferences {
-
         override fun getAll(): MutableMap<String, Any?> = mutableMapOf()
         override fun getString(key: String?, defValue: String?): String? = defValue
         override fun getStringSet(key: String?, defValues: MutableSet<String>?): MutableSet<String>? = defValues
@@ -56,15 +54,15 @@ object SippPrefs {
 
         private object EmptyEditor : SharedPreferences.Editor {
 
-            override fun putString(key: String?, value: String?): SharedPreferences.Editor = this
-            override fun putStringSet(key: String?, values: MutableSet<String>?): SharedPreferences.Editor = this
-            override fun putInt(key: String?, value: Int): SharedPreferences.Editor = this
-            override fun putLong(key: String?, value: Long): SharedPreferences.Editor = this
-            override fun putFloat(key: String?, value: Float): SharedPreferences.Editor = this
-            override fun putBoolean(key: String?, value: Boolean): SharedPreferences.Editor = this
-            override fun remove(key: String?): SharedPreferences.Editor = this
-            override fun clear(): SharedPreferences.Editor = this
-            override fun commit(): Boolean = true
+            override fun putString(key: String?, value: String?) = this
+            override fun putStringSet(key: String?, values: MutableSet<String>?) = this
+            override fun putInt(key: String?, value: Int) = this
+            override fun putLong(key: String?, value: Long) = this
+            override fun putFloat(key: String?, value: Float) = this
+            override fun putBoolean(key: String?, value: Boolean) = this
+            override fun remove(key: String?) = this
+            override fun clear() = this
+            override fun commit() = true
             override fun apply() {}
         }
     }
@@ -97,6 +95,11 @@ object SippPrefs {
     private const val K_MANUAL_SLEEP_ENABLED = "SIPP_manual_sleep_enabled"
     private const val K_MANUAL_SLEEP_START_MIN = "SIPP_manual_sleep_start_min" // 0..1439
     private const val K_MANUAL_SLEEP_END_MIN = "SIPP_manual_sleep_end_min"     // 0..1439
+    private const val K_AUTO_SLEEP_ENABLED = "SIPP_auto_sleep_enabled"
+
+    // xDrip prediction
+    private const val K_XDRIP_ENABLED = "SIPP_xdrip_enabled"
+    private const val K_XDRIP_HORIZON_MIN = "SIPP_xdrip_horizon_min" // 5..120
 
     // Live PK/PD state snapshot
     private const val K_STATE_DIA_H = "SIPP_state_dia_h"
@@ -127,7 +130,7 @@ object SippPrefs {
     private const val K_LAST_SUSTAIN_MIN = "SIPP_last_activity_window_min"
     private const val K_LAST_STEPS_TS = "SIPP_last_steps_ts"
 
-    // ===== Primitive helpers (safe; class-cast guarded) =====
+    // ===== helpers =====
     private fun p(): SharedPreferences = requireReady()
 
     private fun safeGetBoolean(k: String, def: Boolean = false): Boolean =
@@ -209,6 +212,21 @@ object SippPrefs {
     fun setManualSleepEndMin(minSinceMidnight: Int) =
         p().edit { putInt(K_MANUAL_SLEEP_END_MIN, minSinceMidnight.coerceIn(0, 1439)) }
 
+    fun autoSleepEnabled() = safeGetBoolean(K_AUTO_SLEEP_ENABLED)
+    fun setAutoSleepEnabled(v: Boolean) = setBool(K_AUTO_SLEEP_ENABLED, v)
+
+    // ---- Back-compat aliases (match your plugin’s calls) ----
+    fun sleepAutoEnabled() = autoSleepEnabled()
+    fun setSleepAutoEnabled(v: Boolean) = setAutoSleepEnabled(v)
+
+    // xDrip prediction
+    fun enableXdripPrediction() = safeGetBoolean(K_XDRIP_ENABLED)
+    fun setEnableXdripPrediction(v: Boolean) = setBool(K_XDRIP_ENABLED, v)
+
+    /** Horizon in minutes (default 60). Callers clamp to 5..120. */
+    fun xdripHorizonMin(): Int = safeGetIntOrNull(K_XDRIP_HORIZON_MIN) ?: 60
+    fun setXdripHorizonMin(mins: Int) = p().edit { putInt(K_XDRIP_HORIZON_MIN, mins) }
+
     // Site context
     fun siteLocation(): String = safeGetString(K_SITE_LOCATION, "ABDOMEN")
     fun setSiteLocation(v: String) = setString(K_SITE_LOCATION, v)
@@ -252,7 +270,6 @@ object SippPrefs {
             if (targetLowMgdl != null) putFloat(K_LAST_ISF_TARGETLOW_MGDL, targetLowMgdl.toFloat())
         }
     }
-
     fun lastInstantIsfMgdl(): Double? = safeGetFloatOrNull(K_LAST_ISF_USED_MGDL)?.toDouble()
     fun lastInstantIsfTsMs(): Long? = safeGetLongOrNull(K_LAST_ISF_USED_TS)
     fun lastIsfContext(): Pair<Double?, Double?> {
@@ -334,6 +351,11 @@ object SippPrefs {
         put("manualSleepEnabled", manualSleepEnabled())
         put("manualSleepStartMin", manualSleepStartMin())
         put("manualSleepEndMin", manualSleepEndMin())
+        put("autoSleepEnabled", autoSleepEnabled())
+
+        // xDrip prediction
+        put("xdripEnabled", enableXdripPrediction())
+        put("xdripHorizonMin", xdripHorizonMin())
 
         // live state
         loadState()?.let {
@@ -389,6 +411,11 @@ object SippPrefs {
         setManualSleepEnabled(obj.optBoolean("manualSleepEnabled", manualSleepEnabled()))
         setManualSleepStartMin(obj.optInt("manualSleepStartMin", manualSleepStartMin()))
         setManualSleepEndMin(obj.optInt("manualSleepEndMin", manualSleepEndMin()))
+        setAutoSleepEnabled(obj.optBoolean("autoSleepEnabled", autoSleepEnabled()))
+
+        // xDrip prediction
+        setEnableXdripPrediction(obj.optBoolean("xdripEnabled", enableXdripPrediction()))
+        setXdripHorizonMin(obj.optInt("xdripHorizonMin", xdripHorizonMin()))
 
         // live state
         val dia = obj.optDouble("state_diaH", Double.NaN)
