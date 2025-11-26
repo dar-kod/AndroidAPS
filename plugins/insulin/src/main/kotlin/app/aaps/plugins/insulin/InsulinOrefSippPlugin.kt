@@ -321,7 +321,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         parent.addPreference(sippCategory)
 
         val insulinTypePref = ListPreference(context).apply {
-            key = "sipp_insulin_archetype"
+            key = "SIPP_insulin_archetype"
             title = "Insulin archetype for SIPP seeding"
             entries = arrayOf("AUTO (use current preset)", "Rapid-acting (Humalog / NovoRapid)", "Ultra-rapid (Fiasp)", "Lyumjev")
             entryValues = arrayOf("AUTO", "RAPID", "FIASP", "LYUMJEV")
@@ -348,7 +348,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         sippCategory.addPreference(insulinTypePref)
 
         val sippPk = SwitchPreferenceCompat(context).apply {
-            key = "sipp_enable_pk"
+            key = "SIPP_enable_pk"
             title = "Enable SIPP: PK (DIA & Peak)"
             summary = "Let SIPP auto-tune DIA/Peak with safety rails."
             isChecked = SippPrefs.enablePk()
@@ -360,7 +360,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         sippCategory.addPreference(sippPk)
 
         val sippIsf = SwitchPreferenceCompat(context).apply {
-            key = "sipp_enable_isf"
+            key = "SIPP_enable_isf"
             title = "Enable SIPP: ISF"
             summary = "Uses Instant ISF (exp-weighted TDD)."
             isChecked = SippPrefs.enableIsf()
@@ -373,7 +373,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         sippCategory.addPreference(sippIsf)
 
         val sippDiaExpert = SwitchPreferenceCompat(context).apply {
-            key = "sipp_allow_dia_above_9h"
+            key = "SIPP_allow_dia_above_9h"
             title = "Allow DIA > 9 h (expert)"
             summary = "Allows SIPP to extend DIA up to 24 h for slow sites/stacking."
             isChecked = SippPrefs.allowDiaAbove9h()
@@ -395,7 +395,7 @@ class InsulinOrefSippPlugin @Inject constructor(
 
         // ---- SIPP Sleep / Recovery ----
         val sleepMaster = SwitchPreferenceCompat(context).apply {
-            key = "sipp_enable_sleep_recovery"
+            key = "SIPP_enable_sleep_recovery"
             title = "Sleep-aware DIA"
             summary = "Apply gentler DIA ceiling during sleep."
             isChecked = SippPrefs.enableSleepRecovery()
@@ -403,7 +403,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         sleepCat.addPreference(sleepMaster)
 
         val autoToggle = SwitchPreferenceCompat(context).apply {
-            key = "sipp_sleep_auto_enabled"
+            key = "SIPP_auto_sleep_enabled"
             title = "Auto sleep (watch HR & steps)"
             summary = "Detect sleep from low HR, no cadence, sustained inactivity."
             isChecked = SippPrefs.sleepAutoEnabled()
@@ -411,7 +411,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         sleepCat.addPreference(autoToggle)
 
         val manualToggle = SwitchPreferenceCompat(context).apply {
-            key = "sipp_manual_sleep_enabled"
+            key = "SIPP_manual_sleep_enabled"
             title = "Manual sleep window"
             summary = "Use fixed times when no wearable sleep signal is present."
             isChecked = SippPrefs.manualSleepEnabled()
@@ -500,7 +500,7 @@ class InsulinOrefSippPlugin @Inject constructor(
 
         // ===== SIPP – Dosing rails =====
         val sippBasalToggle = SwitchPreferenceCompat(context).apply {
-            key = "sipp_enable_basal"
+            key = "SIPP_enable_basal"
             title = "Apply SIPP Instant Basal"
             summary = "Use SIPP’s calculated basal (from Used ISF) as the current basal input."
             isChecked = SippPrefs.enableBasal()
@@ -513,7 +513,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         sippCategory.addPreference(sippBasalToggle)
 
         val sippMaxBasalToggle = SwitchPreferenceCompat(context).apply {
-            key = "sipp_enable_max_basal"
+            key = "SIPP_enable_max_basal"
             title = "Apply SIPP Max Temp Basal cap"
             summary = "Limit temp basals to SIPP’s suggested maximum."
             isChecked = SippPrefs.enableMaxBasal()
@@ -527,7 +527,7 @@ class InsulinOrefSippPlugin @Inject constructor(
 
         // Site context
         val siteLocationPref = ListPreference(context).apply {
-            key = "sipp_site_location"
+            key = "SIPP_site_location"
             title = "Site Location"
             entries = arrayOf("Abdomen", "Arm", "Thigh")
             entryValues = arrayOf("ABDOMEN", "ARM", "THIGH")
@@ -544,7 +544,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         sippCategory.addPreference(siteLocationPref)
 
         val siteAgeEnabledPref = SwitchPreferenceCompat(context).apply {
-            key = "sipp_site_age_enabled"
+            key = "SIPP_site_age_enabled"
             title = "Use Site Age Effect (advanced)"
             summary = "OFF recommended for Medtrum Nano."
             isChecked = SippPrefs.siteAgeEnabled()
@@ -556,7 +556,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         sippCategory.addPreference(siteAgeEnabledPref)
 
         val siteAgePref = EditTextPreference(context).apply {
-            key = "sipp_site_age_h"
+            key = "SIPP_site_age_h"
             title = "Site Age (hours)"
             dialogTitle = "Enter hours since insertion"
             val currentAge = SippPrefs.siteAgeH()
@@ -612,7 +612,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         parent.addPreference(category)
 
         val master = SwitchPreferenceCompat(context).apply {
-            key = "sipp_enable_activity_fusion_ui"
+            key = "SIPP_enable_activity_fusion"
             title = "Use activity fusion (HR & steps)"
             summary = "Small ISF weakening (+3–12%) and up to +10 min peak shift; DIA never shortened."
             isChecked = SippPrefs.enableActivityFusion()
@@ -627,7 +627,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         }
 
         val hrPref = SwitchPreferenceCompat(context).apply {
-            key = "sipp_use_hr_ui"
+            key = "SIPP_use_hr"
             title = "Use heart-rate"
             summary = "Treat HR ≥100 bpm as activity (adds small, capped ISF weakening)."
             isChecked = SippPrefs.useHr()
@@ -640,7 +640,7 @@ class InsulinOrefSippPlugin @Inject constructor(
         }
 
         val stepsPref = SwitchPreferenceCompat(context).apply {
-            key = "sipp_use_steps_ui"
+            key = "SIPP_use_steps"
             title = "Use steps / cadence"
             summary = "Active when ≥60 steps/min for ≥5 min."
             isChecked = SippPrefs.useSteps()
