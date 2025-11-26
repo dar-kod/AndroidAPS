@@ -88,15 +88,15 @@ class InsulinOrefSippPlugin @Inject constructor(
         busSubs.clear()
     }
 
-    override val id: Insulin.InsulinType get() = Insulin.InsulinType.OREF_FREE_PEAK
-    override val friendlyName get(): String = rh.gs(R.string.free_peak_oref)
+    override val id: Insulin.InsulinType get() = Insulin.InsulinType.OREF_SIPP
+    override val friendlyName get(): String = rh.gs(R.string.sipp_instant_insulin)
 
     init {
         pluginDescription
-            // icon intentionally omitted to avoid drawable mismatches
-            .pluginName(R.string.free_peak_oref)
+            .pluginIcon(R.drawable.ic_insulin)
+            .pluginName(R.string.sipp_instant_insulin)
             .preferencesId(PluginDescription.PREFERENCE_SCREEN)
-            .description(R.string.description_insulin_free_peak)
+            .description(R.string.description_insulin_sipp_instant)
     }
 
     override fun configuration(): JSONObject =
