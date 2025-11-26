@@ -118,7 +118,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         .mainType(PluginType.APS)
         .fragmentClass(OpenAPSFragment::class.java.name)
         .pluginIcon(app.aaps.core.ui.R.drawable.ic_generic_icon)
-        .pluginName(R.string.openapssmb)
+        .pluginName(R.string.sipp_smb_shortname)
         .shortName(R.string.sipp_smb_shortname)
         .preferencesId(PluginDescription.PREFERENCE_SCREEN)
         .preferencesVisibleInSimpleMode(false)
