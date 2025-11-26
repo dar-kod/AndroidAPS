@@ -335,19 +335,6 @@ class InsulinOrefSippPlugin @Inject constructor(
         if (requiredKey != null) return
         SippPrefs.init(context)
 
-        // ===== Free-Peak section =====
-        val fpCat = PreferenceCategory(context).apply {
-            key = "insulin_free_peak_settings"
-            title = rh.gs(R.string.insulin_oref_peak)
-            initialExpandedChildrenCount = 0
-        }
-        parent.addPreference(fpCat)
-        fpCat.addPreference(
-            app.aaps.core.validators.preferences.AdaptiveIntPreference(
-                ctx = context, intKey = IntKey.InsulinOrefPeak, title = R.string.insulin_peak_time
-            )
-        )
-
         // ===== SIPP section =====
         val sippCategory = PreferenceCategory(context).also {
             it.key = "insulin_sipp_settings"
