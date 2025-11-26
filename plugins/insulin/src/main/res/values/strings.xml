@@ -15,6 +15,7 @@
     <string name="dia_too_short">DIA of %1$f too short - using %2$f instead!</string>
     <string name="fast_acting_insulin_comment">Novorapid, Novolog, Humalog</string>
     <string name="ultra_fast_acting_insulin_comment">Fiasp</string>
-
+    <string name="sipp_instant_insulin">SIPP Instant PKPD</string>
+    <string name="description_insulin_sipp_instant">Insulin preset driven by Sentinel PK and PD, adjusting in real time to infusion site, sleep and activity.</string>
 
 </resources>

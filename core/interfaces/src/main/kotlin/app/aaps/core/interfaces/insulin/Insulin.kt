@@ -15,7 +15,8 @@ interface Insulin : ConfigExportImport {
         OREF_RAPID_ACTING(2),
         OREF_ULTRA_RAPID_ACTING(3),
         OREF_FREE_PEAK(4),
-        OREF_LYUMJEV(5);
+        OREF_LYUMJEV(5),
+        OREF_SIPP(6);
 
         companion object {
 
