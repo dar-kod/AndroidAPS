@@ -230,17 +230,8 @@ class InsulinOrefSippPlugin @Inject constructor(
         }
 
         // Instant Basal
-        val instBasal: Double? = runCatching {
-            if (!SippPrefs.enableBasal()) null
-            else {
-                val isfMgdl = usedIsfMgdl ?: return@runCatching null
-                if (isfMgdl <= 0.0) null
-                else {
-                    val tddEst = 1800.0 / isfMgdl
-                    round2(0.45 * tddEst / 24.0)
-                }
-            }
-        }.getOrNull()
+        // Instant Basal
+        val instBasal: Double? = if (SippPrefs.enableBasal()) SippPrefs.lastInstantBasalUph() else null
 
         sippBasalRow?.summary = when {
             instBasal != null && instBasal > 0.0 ->
@@ -250,23 +241,8 @@ class InsulinOrefSippPlugin @Inject constructor(
         }
 
         // Max Basal
-        val instMaxBasal: Double? = runCatching {
-            if (!SippPrefs.enableMaxBasal()) null
-            else {
-                val isfMgdl = usedIsfMgdl ?: return@runCatching null
-                if (isfMgdl <= 0.0 || prof == null) null
-                else {
-                    val tddEst = 1800.0 / isfMgdl
-                    val instantBasal = 0.45 * tddEst / 24.0
-                    val scheduled = prof.getBasal()
-                    val fromMultiplier = scheduled * 1.8
-                    val fromInstant = instantBasal * 3.0
-                    val fromDaily = prof.getMaxDailyBasal() * preferences.get(DoubleKey.ApsMaxDailyMultiplier)
-                    val unclamped = maxOf(fromMultiplier, fromInstant, fromDaily)
-                    round2(unclamped.coerceAtMost(hardLimits.maxBasal()))
-                }
-            }
-        }.getOrNull()
+        // Max Basal
+        val instMaxBasal: Double? = if (SippPrefs.enableMaxBasal()) SippPrefs.lastMaxBasalUph() else null
 
         sippMaxBasalRow?.summary = when {
             instMaxBasal != null && instMaxBasal > 0.0 ->
@@ -291,6 +267,7 @@ class InsulinOrefSippPlugin @Inject constructor(
     private fun fmt2(v: Double) = String.format(Locale.getDefault(), "%.2f", v)
 
     private fun safeUiRefresh() {
+        sippDiaRowRef?.context?.let { SippPrefs.init(it) }
         updateSippReadouts(
             sippDiaRowRef, sippPeakRowRef, sippIsfRowRef, sippBasalRowRef, sippMaxBasalRowRef, sippDiagRowRef
         )

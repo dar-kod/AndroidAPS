@@ -424,9 +424,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
 
     private fun synthesizeIfMissing(profile: Profile, usedIsfMgdl: Double, deliveredBasalNow: Double, minutesRunning: Int, minBg: Double, isTempTarget: Boolean) {
         if (usedIsfMgdl <= 0.0) return
-        val haveBasal = (SippPrefs.lastInstantBasalUph() ?: 0.0) > 0.0
-        val haveMax = (SippPrefs.lastMaxBasalUph() ?: 0.0) > 0.0
-        if (haveBasal && haveMax) return
+        // Always update basal suggestions based on latest ISF/state
         val gs = glucoseStatusProvider.glucoseStatusData
         val dpm = try {
             gs?.delta ?: 0.0
