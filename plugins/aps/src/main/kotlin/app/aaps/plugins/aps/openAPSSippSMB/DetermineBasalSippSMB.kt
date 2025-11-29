@@ -150,7 +150,7 @@ class DetermineBasalSippSMB @Inject constructor(
 
     fun determine_basal(
         glucose_status: GlucoseStatus, currenttemp: CurrentTemp, iob_data_array: Array<IobTotal>, profile: OapsProfile, autosens_data: AutosensResult, meal_data: MealData,
-        microBolusAllowed: Boolean, currentTime: Long, flatBGsDetected: Boolean, dynIsfMode: Boolean
+        microBolusAllowed: Boolean, currentTime: Long, flatBGsDetected: Boolean, dynIsfMode: Boolean, isSleepState: Boolean
     ): RT {
         consoleError.clear()
         consoleLog.clear()
@@ -314,14 +314,38 @@ class DetermineBasalSippSMB @Inject constructor(
             }
         }
 
+        // SIPP SAFETY: Sleep Band Guard
+        // Definition: BG 4.0-6.0 mmol/L (72-108 mg/dL), flat trend, and Sleep/HighSensitivity state.
+        val isSleepBand = isSleepState &&
+            bg >= 72 && bg <= 108 &&
+            Math.abs(glucose_status.delta) < 3
+
+        // SIPP SAFETY: Resistance Mode Guard
+        // Definition: BG > 12 mmol/L (216 mg/dL), flat/rising trend, and significant active insulin.
+        // IOB threshold: >= 2.0 U OR >= 50% of theoretical correction need.
+        val theoreticalCorrectionForResistance = max(0.0, (bg - target_bg) / sens)
+        val isResistance = bg > 216 &&
+            glucose_status.longAvgDelta > -1.0 &&
+            (iob_data.iob >= 2.0 || iob_data.iob >= theoreticalCorrectionForResistance * 0.5)
+
+        if (isResistance) {
+            rT.reason.append("SIPP: Suspected resistance. Bounds relaxed. Check site. ")
+            consoleError.add("SIPP: Suspected resistance (BG > 216, Flat, IOB active). Bounds relaxed.")
+        }
+
         // calculate the naive (bolus calculator math) eventual BG based on net IOB and sensitivity
         val naive_eventualBG =
             if (dynIsfMode)
                 round(bg - (iob_data.iob * sens), 0)
             else {
-                if (iob_data.iob > 0) round(bg - (iob_data.iob * sens), 0)
+                // SIPP SAFETY: "The Vacuum Effect" Fix
+                // If in Sleep Band and IOB is negative, clamp effective IOB to 0 for dosing calculations.
+                // This prevents "missing insulin" logic from triggering aggressive dosing in safe sleep range.
+                val effectiveIOB = if (isSleepBand && iob_data.iob < 0) 0.0 else iob_data.iob
+                
+                if (effectiveIOB > 0) round(bg - (effectiveIOB * sens), 0)
                 else  // if IOB is negative, be more conservative and use the lower of sens, profile.sens
-                    round(bg - (iob_data.iob * min(sens, profile.sens)), 0)
+                    round(bg - (effectiveIOB * min(sens, profile.sens)), 0)
             }
         // and adjust it for the deviation above
         var eventualBG = naive_eventualBG + deviation
@@ -1039,11 +1063,59 @@ class DetermineBasalSippSMB @Inject constructor(
                 insulinReq = max_iob - iob_data.iob
             }
 
+            // SIPP SAFETY: "The Panic Stack" Fix (Correction Bounds)
+            // Bound total correction insulin (IOB + new SMB) to a multiple of theoretical need.
+            val theoreticalCorrection = max(0.0, (bg - target_bg) / sens)
+            val correctionBoundFactor = if (isResistance) 1.5 else 1.2
+            val correctionLimit = theoreticalCorrection * correctionBoundFactor
+
+            // Check if we are already over the limit
+            if (iob_data.iob > correctionLimit) {
+                rT.reason.append("SIPP Safety: IOB ${round(iob_data.iob, 2)} > Limit ${round(correctionLimit, 2)} (${correctionBoundFactor}x). SMB=0, Neutral Basal. ")
+                consoleError.add("SIPP Safety: IOB > Correction Limit. SMB disabled, Basal reset to profile.")
+                // Force neutral basal (profile.current_basal) and zero SMB
+                // We return immediately to prevent SMB logic from running
+                return setTempBasal(profile.current_basal, 30, profile, rT, currenttemp)
+            }
+
             // rate required to deliver insulinReq more insulin over 30m:
             var rate = basal + (2 * insulinReq)
+            
+            // SIPP SAFETY: Sleep Band Basal Cap
+            if (isSleepBand) {
+                val sleepBasalCap = profile.current_basal * 1.1
+                if (rate > sleepBasalCap) {
+                    rT.reason.append("SIPP Sleep: Cap basal ${round(rate, 2)} -> ${round(sleepBasalCap, 2)}. ")
+                    rate = sleepBasalCap
+                    // Recalculate insulinReq based on capped rate to keep things consistent downstream
+                    // rate = basal + 2 * insulinReq  =>  insulinReq = (rate - basal) / 2
+                    insulinReq = max(0.0, (rate - basal) / 2)
+                }
+            }
+
             rate = round_basal(rate)
             insulinReq = round(insulinReq, 3)
             rT.insulinReq = insulinReq
+
+            // SIPP SAFETY: Sleep Band SMB Disable
+            if (isSleepBand && enableSMB) {
+                rT.reason.append("SIPP Sleep: SMB disabled in safe band. ")
+                enableSMB = false
+            }
+
+            // SIPP SAFETY: Enforce Correction Bound on new SMB
+            // If adding insulinReq (approx SMB size) would push us over, clamp it.
+            // Note: Actual SMB size is calculated below as microBolus, but we clamp insulinReq here to influence it.
+            if (iob_data.iob + insulinReq > correctionLimit) {
+                val maxAllowed = max(0.0, correctionLimit - iob_data.iob)
+                if (insulinReq > maxAllowed) {
+                    rT.reason.append("SIPP Safety: Clamping req ${round(insulinReq, 2)} -> ${round(maxAllowed, 2)} to fit limit. ")
+                    insulinReq = round(maxAllowed, 3)
+                    rT.insulinReq = insulinReq
+                    // Recalculate rate based on clamped insulinReq
+                    rate = round_basal(basal + (2 * insulinReq))
+                }
+            }
             //console.error(iob_data.lastBolusTime);
             //console.error(profile.temptargetSet, target_bg, rT.COB);
             // only allow microboluses with COB or low temp targets, or within DIA hours of a bolus

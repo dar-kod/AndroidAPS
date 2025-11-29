@@ -847,6 +847,16 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         aapsLogger.debug(LTag.APS, "flatBGsDetected:    $flatBGsDetected")
         aapsLogger.debug(LTag.APS, "DynIsfMode:         ${preferences.get(BooleanKey.ApsUseDynamicSensitivity)}")
 
+        // SIPP Sleep State Detection
+        // Used for "Sleep Band" safety guard in DetermineBasalSippSMB
+        val isManualSleep = SippPrefs.manualSleepEnabled() && isNowInWindow(SippPrefs.manualSleepStartMin(), SippPrefs.manualSleepEndMin())
+        val isAutoSleep = if (SippPrefs.sleepAutoEnabled()) runCatching {
+            val snap = sentinelController.activitySnapshot()
+            (!snap.hrActive && !snap.cadenceActive && snap.sustainedActiveMin >= 20)
+        }.getOrDefault(false) else false
+        
+        val isSleepState = isManualSleep || isAutoSleep
+
         determineBasalSMB.determine_basal(
             glucose_status = glucoseStatus,
             currenttemp = currentTemp,
@@ -857,7 +867,8 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             microBolusAllowed = microBolusAllowed,
             currentTime = now,
             flatBGsDetected = flatBGsDetected,
-            dynIsfMode = preferences.get(BooleanKey.ApsUseDynamicSensitivity) && (dynIsfResult.tddPartsCalculated())
+            dynIsfMode = dynIsfMode && dynIsfResult.tddPartsCalculated(),
+            isSleepState = isSleepState
         ).also {
             val determineBasalResult = apsResultProvider.get().with(it)
             determineBasalResult.inputConstraints = inputConstraints
@@ -1240,5 +1251,11 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
                 // =====================================================
             })
         }
+    }
+
+    private fun isNowInWindow(startMin: Int, endMin: Int): Boolean {
+        val now = java.util.Calendar.getInstance()
+        val nowMin = now.get(java.util.Calendar.HOUR_OF_DAY) * 60 + now.get(java.util.Calendar.MINUTE)
+        return if (startMin <= endMin) nowMin in startMin..endMin else nowMin >= startMin || nowMin <= endMin
     }
 }
