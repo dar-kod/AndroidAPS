@@ -22,6 +22,7 @@ import app.aaps.core.interfaces.aps.APSResult
 import app.aaps.core.interfaces.aps.AutosensResult
 import app.aaps.core.interfaces.aps.CurrentTemp
 import app.aaps.core.interfaces.aps.GlucoseStatus
+import app.aaps.core.interfaces.aps.GlucoseStatusSMB
 import app.aaps.core.interfaces.aps.OapsProfile
 import app.aaps.core.interfaces.bgQualityCheck.BgQualityCheck
 import app.aaps.core.interfaces.configuration.Config
@@ -468,7 +469,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             aapsLogger.debug(LTag.APS, rh.gs(R.string.openapsma_disabled))
             return
         }
-        val glucoseStatus = glucoseStatusProvider.glucoseStatusData
+        val glucoseStatus = glucoseStatusProvider.glucoseStatusData as? GlucoseStatusSMB
         if (glucoseStatus == null) {
             rxBus.send(EventResetOpenAPSGui(rh.gs(R.string.openapsma_no_glucose_data)))
             aapsLogger.debug(LTag.APS, rh.gs(R.string.openapsma_no_glucose_data))
@@ -733,7 +734,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             temptargetSet = isTempTarget,
             autosens_max = preferences.get(DoubleKey.AutosensMax),
             out_units = if (profileFunction.getUnits() == GlucoseUnit.MMOL) "mmol/L" else "mg/dl",
-            variable_sens = if (preferences.get(BooleanKey.ApsUseDynamicSensitivity)) (dsIsf ?: 0.0) else 0.0,
+            variable_sens = if (dynIsfMode && dynIsfResult.tddPartsCalculated()) (dsIsf ?: 0.0) else 0.0,
             insulinDivisor = 0,
             TDD = calculateVariableIsf(now, epsMultiplier).second?.let { 1800.0 / it } ?: (dynIsfResult.tdd ?: 0.0)
         )
