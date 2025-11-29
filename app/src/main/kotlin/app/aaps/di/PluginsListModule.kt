@@ -6,6 +6,8 @@ import app.aaps.plugins.aps.loop.LoopPlugin
 import app.aaps.plugins.aps.openAPSAMA.OpenAPSAMAPlugin
 import app.aaps.plugins.aps.openAPSAutoISF.OpenAPSAutoISFPlugin
 import app.aaps.plugins.aps.openAPSSMB.OpenAPSSMBPlugin
+import app.aaps.plugins.aps.openAPSSippSMB.OpenAPSSippSMBPlugin
+import app.aaps.plugins.insulin.InsulinOrefSippPlugin
 import app.aaps.plugins.automation.AutomationPlugin
 import app.aaps.plugins.configuration.configBuilder.ConfigBuilderPlugin
 import app.aaps.plugins.configuration.maintenance.MaintenancePlugin
@@ -131,6 +133,12 @@ abstract class PluginsListModule {
     @Binds
     @AllConfigs
     @IntoMap
+    @IntKey(51)
+    abstract fun bindInsulinOrefSippPlugin(plugin: InsulinOrefSippPlugin): PluginBase
+
+    @Binds
+    @AllConfigs
+    @IntoMap
     @IntKey(60)
     abstract fun bindSensitivityAAPSPlugin(plugin: SensitivityAAPSPlugin): PluginBase
 
@@ -247,6 +255,12 @@ abstract class PluginsListModule {
     @IntoMap
     @IntKey(220)
     abstract fun bindOpenAPSSMBPlugin(plugin: OpenAPSSMBPlugin): PluginBase
+
+    @Binds
+    @AllConfigs
+    @IntoMap
+    @IntKey(221)
+    abstract fun bindOpenAPSSippSMBPlugin(plugin: OpenAPSSippSMBPlugin): PluginBase
 
     @Binds
     @AllConfigs

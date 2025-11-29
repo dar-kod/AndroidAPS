@@ -1,4 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="app.aaps.plugins.insulin">
 
+    <application>
+        <provider
+            android:name="app.aaps.plugins.insulin.sipp.SippPrefsInitProvider"
+            android:authorities="${applicationId}.sipp.init"
+            android:exported="false"
+            android:initOrder="100" />
+    </application>
 </manifest>
