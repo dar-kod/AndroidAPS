@@ -476,6 +476,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             return
         }
 
+
         val profile = profileAny
         val inputConstraints = ConstraintObject(0.0, aapsLogger)
 
@@ -593,11 +594,9 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
 
         if (allowPkLearning) {
             runCatching {
-                val gs = glucoseStatus
-                val nowMs = now
-                val bgNow = gs.glucose
+                val bgNow = glucoseStatus.glucose
                 val deltaPerMin = try {
-                    gs.delta
+                    glucoseStatus.delta
                 } catch (_: Throwable) {
                     0.0
                 }
@@ -617,7 +616,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
                 }
 
                 sentinelController.applyEvidence(
-                    nowMs = nowMs,
+                    nowMs = now,
                     bgNow = bgNow,
                     bgPred = bgPred,
                     deltaPerMin = deltaPerMin,
@@ -743,8 +742,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         runCatching {
             val unitsMmol = (profileFunction.getUnits() == GlucoseUnit.MMOL)
 
-            val usedIsfMgdl = sensForJs
-            val displayIsf = if (unitsMmol) usedIsfMgdl / 18.0 else usedIsfMgdl
+            val displayIsf = if (unitsMmol) sensForJs / 18.0 else sensForJs
             val isfUnit = if (unitsMmol) "mmol/L/U" else "mg/dL/U"
 
             val persisted = SippPrefs.loadState()
