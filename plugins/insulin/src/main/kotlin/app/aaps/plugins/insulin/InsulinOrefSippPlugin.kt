@@ -50,8 +50,13 @@ class InsulinOrefSippPlugin @Inject constructor(
     config: Config,
     hardLimits: HardLimits,
     uiInteraction: UiInteraction,
-    private val sipp: SentinelPkPdController
+    private val sipp: SentinelPkPdController,
+    sharedPreferences: android.content.SharedPreferences
 ) : InsulinOrefBasePlugin(rh, profileFunction, rxBus, aapsLogger, config, hardLimits, uiInteraction) {
+
+    init {
+        SippPrefs.init(sharedPreferences)
+    }
 
     private companion object {
         private const val GLOBAL_PEAK_MIN_MIN = 45
