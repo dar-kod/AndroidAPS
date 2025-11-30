@@ -28,6 +28,17 @@ object SippPrefs {
         }
     }
 
+    @JvmStatic
+    fun init(prefs: SharedPreferences) {
+        if (sp == null) {
+            synchronized(this) {
+                if (sp == null) {
+                    sp = prefs
+                }
+            }
+        }
+    }
+
     /** Obtain a ready SP or a benign stub (never crashes). */
     private fun requireReady(): SharedPreferences {
         sp?.let { return it }
