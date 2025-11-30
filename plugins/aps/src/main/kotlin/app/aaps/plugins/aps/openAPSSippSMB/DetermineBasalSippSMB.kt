@@ -17,9 +17,11 @@ import java.time.ZoneId
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.ln
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.round
 import kotlin.math.roundToInt
 
 @Singleton
@@ -150,7 +152,7 @@ class DetermineBasalSippSMB @Inject constructor(
 
     fun determine_basal(
         glucose_status: GlucoseStatus, currenttemp: CurrentTemp, iob_data_array: Array<IobTotal>, profile: OapsProfile, autosens_data: AutosensResult, meal_data: MealData,
-        microBolusAllowed: Boolean, currentTime: Long, flatBGsDetected: Boolean, dynIsfMode: Boolean, isSleepState: Boolean
+        microBolusAllowed: Boolean, currentTime: Long, flatBGsDetected: Boolean, dynIsfMode: Boolean, isSleepState: Boolean, sippPeakMinutes: Int
     ): RT {
         consoleError.clear()
         consoleLog.clear()
@@ -1062,6 +1064,116 @@ class DetermineBasalSippSMB @Inject constructor(
                 rT.reason.append("max_iob $max_iob, ")
                 insulinReq = max_iob - iob_data.iob
             }
+
+            // SIPP PEAK RESCUE SMB
+            // "Unannounced Rise" Logic: If BG is high, rising, and predicted to peak high, add rescue SMB.
+            // Trigger 1.1: BG high enough and above target
+            val internalHighStart = 108.0 // ~6.0 mmol/L
+            val internalHighConcern = 120.0 // ~6.7 mmol/L
+            val internalPeakMargin = 10.0 // ~0.5 mmol/L
+            val minRiseThreshold = 1.0 // mg/dL/5m
+            val minHorizon = 90
+            val maxHorizon = 180
+            val internalFactorIOB = 0.4
+            val internalFractionOfBaseline = 0.5
+
+            var peakRescueInsulinReq = 0.0
+
+            // Check triggers
+            if (bg > target_bg && bg > internalHighStart &&
+                minDelta > minRiseThreshold &&
+                !profile.exercise_mode && profile.half_basal_exercise_target == 0 // Trigger 1.5: No exercise/low target
+            ) {
+                // Trigger 1.3: Predicted peak above target within horizon
+                val peakHorizonMinutes = max(minHorizon, min(maxHorizon, sippPeakMinutes))
+                var peakBG = 0.0
+                
+                // Scan predictions up to horizon
+                // Note: predBGs are 5-minute intervals. index * 5 = minutes.
+                val maxIndex = peakHorizonMinutes / 5
+                
+                // Helper to scan a curve
+                fun scanCurve(curve: List<Double>?) {
+                    curve?.let {
+                        for (i in 0 until min(it.size, maxIndex)) {
+                            if (it[i] > peakBG) peakBG = it[i]
+                        }
+                    }
+                }
+                
+                scanCurve(IOBpredBGs)
+                scanCurve(COBpredBGs)
+                scanCurve(UAMpredBGs)
+                // ZTpredBGs usually track IOB/COB but good to include if they exist and are higher? 
+                // Usually IOB/COB/UAM cover it. SIPP SMB uses these.
+
+                // Check peak severity
+                if (peakBG > target_bg + internalPeakMargin && peakBG > internalHighConcern) {
+                    // Trigger 1.4: No low risk conflict
+                    // We must ensure NO prediction curve dips below threshold (or min_bg?) within the horizon
+                    // SIPP SMB uses minPredBG for safety. If minPredBG < threshold, we shouldn't be here?
+                    // Actually, minPredBG is the minimum of the curves. If minPredBG < threshold, we should skip.
+                    // We already have minPredBG calculated earlier.
+                    // Let's check minPredBG against a safety floor.
+                    
+                    // Also check if any curve dips low within the horizon specifically? 
+                    // minPredBG is the global minimum of the curves.
+                    if (minPredBG > threshold) {
+                         // 2. Extra correction calculation
+                         val rawCorrectionUnits = max(0.0, (peakBG - target_bg) / sens)
+                         val iobCompensation = internalFactorIOB * iob_data.iob
+                         // Ensure we don't subtract negative IOB (which would add insulin) - though IOB should be positive here if we are high?
+                         // If IOB is negative, iobCompensation is negative. 
+                         // effectivelyCorrection = raw - clamp(neg, 0, raw) = raw - 0 = raw. 
+                         // Wait, if IOB is negative, we might want to add MORE? 
+                         // The prompt says "Estimate how much of that correction is likely covered by existing IOB and subtract a portion".
+                         // If IOB is negative, it's not covering anything. So subtraction should be 0.
+                         // clamp(iobCompensation, 0.0, rawCorrectionUnits) handles this correctly (0 if neg).
+                         
+                         val effectiveCorrection = max(0.0, rawCorrectionUnits - max(0.0, min(iobCompensation, rawCorrectionUnits)))
+                         
+                         peakRescueInsulinReq = effectiveCorrection
+                         
+                         // 3. Safety Caps
+                         // Cap relative to baseline insulinReq (absolute value)
+                         // baselineInsulinReq is 'insulinReq' at this point.
+                         val baselineCap = internalFractionOfBaseline * abs(insulinReq)
+                         
+                         // If baseline is 0 (e.g. minPredBG > target but < eventualBG?), we might still want to rescue?
+                         // "Let baselineInsulinReq be the insulinReq that SIPP SMB currently computes without this feature."
+                         // If SIPP computes 0, then 0.5 * 0 = 0. So we wouldn't rescue if SIPP doesn't think we need ANY insulin?
+                         // That seems to imply this feature only *boosts* existing SMBs.
+                         // "Combine them: insulinReqTotal = baselineInsulinReq + peakRescueInsulinReq"
+                         // If baseline is 0, we can't boost.
+                         // But if SIPP sees rising BG, it usually calculates *some* insulinReq if eventualBG > target.
+                         // If insulinReq is 0 here, it means min(minPredBG, eventualBG) <= target_bg.
+                         // If minPredBG <= target, we shouldn't be adding rescue insulin anyway (Trigger 1.4 check implies we are safe, but maybe not high enough to trigger normal SMB).
+                         // But Trigger 1.3 requires peakBG > target.
+                         // If minPredBG is low but peak is high, we have a "dip then rise" or "rise then dip".
+                         // If minPredBG > threshold, we are safe from lows.
+                         // If insulinReq is small, we want to make it bigger.
+                         // If insulinReq is 0, can we add?
+                         // The prompt says: "Keep it bounded relative to baseline SIPP SMB... peakRescueUnits <= INTERNAL_FRACTION_OF_BASELINE * |baselineInsulinReq|"
+                         // This strictly implies if baseline is 0, rescue is 0.
+                         // This makes it a "Booster" only.
+                         
+                         if (peakRescueInsulinReq > baselineCap) {
+                             peakRescueInsulinReq = baselineCap
+                         }
+                         
+                         // If very small, skip
+                         if (peakRescueInsulinReq < 0.05) { // epsilon
+                             peakRescueInsulinReq = 0.0
+                         }
+                         
+                         if (peakRescueInsulinReq > 0) {
+                             rT.reason.append(" PeakRescue +${round(peakRescueInsulinReq, 2)}U (Peak ${convert_bg(peakBG)}). ")
+                             insulinReq += peakRescueInsulinReq
+                         }
+                    }
+                }
+            }
+
 
             // SIPP SAFETY: "The Panic Stack" Fix (Correction Bounds)
             // Bound total correction insulin (IOB + new SMB) to a multiple of theoretical need.

@@ -739,20 +739,22 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         )
 
         // ---- SIPP + xDrip banner (in Constraints section) ----
+        val persisted = SippPrefs.loadState()
+        val profPeakMin = preferences.get(IntKey.InsulinOrefPeak)
+        val fromSippMin = (persisted?.tPeakMin
+            ?: (sentinelController.current().peakH?.times(60f)?.roundToInt() ?: profPeakMin))
+        val peakMin = fromSippMin.coerceIn(45, if (SippPrefs.allowDiaAbove9h()) 240 else 210)
+
         runCatching {
             val unitsMmol = (profileFunction.getUnits() == GlucoseUnit.MMOL)
 
             val displayIsf = if (unitsMmol) sensForJs / 18.0 else sensForJs
             val isfUnit = if (unitsMmol) "mmol/L/U" else "mg/dL/U"
 
-            val persisted = SippPrefs.loadState()
+
             val diaUpper = if (SippPrefs.allowDiaAbove9h()) 24f else 12f
             val diaH = ((persisted?.diaH ?: sentinelController.current().diaH).coerceIn(4.5f, diaUpper)).toDouble()
 
-            val profPeakMin = preferences.get(IntKey.InsulinOrefPeak)
-            val fromSippMin = (persisted?.tPeakMin
-                ?: (sentinelController.current().peakH?.times(60f)?.roundToInt() ?: profPeakMin))
-            val peakMin = fromSippMin.coerceIn(45, if (SippPrefs.allowDiaAbove9h()) 240 else 210)
 
             // Pull TRUE “Instant” values from SIPP (not the decayed JS inputs)
             val instantBasal = if (SippPrefs.enableBasal()) SippPrefs.lastInstantBasalUph() else null
@@ -864,6 +866,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             autosens_data = autosensResult,
             meal_data = mealData,
             microBolusAllowed = microBolusAllowed,
+            sippPeakMinutes = peakMin,
             currentTime = now,
             flatBGsDetected = flatBGsDetected,
             dynIsfMode = dynIsfMode && dynIsfResult.tddPartsCalculated(),
