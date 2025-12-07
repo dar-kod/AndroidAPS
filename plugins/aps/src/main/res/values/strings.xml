@@ -223,5 +223,8 @@
     <string name="sipp_smb_shortname">SIPP</string>
     <string name="openapssmb_max_frequency">Max SMB Frequency</string>
     <string name="openapssmb_max_minutes_basal_limit">Max minutes of basal to limit SMB</string>
+    <string name="sipp_enable_guard">Enable SIPP high/low guard</string>
+    <string name="sipp_enable_guard_summary">Prevents overdosing by stopping SMB and capping basal when SIPP prediction curves detect strong future lows. Uses AAPS predictions as a safety brake.</string>
+    <string name="sipp_guard_horizon_label">SIPP guard horizon</string>
 
 </resources>
