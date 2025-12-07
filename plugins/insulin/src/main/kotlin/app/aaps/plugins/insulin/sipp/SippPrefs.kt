@@ -108,10 +108,6 @@ object SippPrefs {
     private const val K_MANUAL_SLEEP_END_MIN = "SIPP_manual_sleep_end_min"     // 0..1439
     private const val K_AUTO_SLEEP_ENABLED = "SIPP_auto_sleep_enabled"
 
-    // xDrip prediction
-    private const val K_XDRIP_ENABLED = "SIPP_xdrip_enabled"
-    private const val K_XDRIP_HORIZON_MIN = "SIPP_xdrip_horizon_min" // 5..120
-
     // Live PK/PD state snapshot
     private const val K_STATE_DIA_H = "SIPP_state_dia_h"
     private const val K_STATE_TPEAK_MIN = "SIPP_state_tpeak_min"
@@ -229,14 +225,6 @@ object SippPrefs {
     // ---- Back-compat aliases (match your plugin’s calls) ----
     fun sleepAutoEnabled() = autoSleepEnabled()
     fun setSleepAutoEnabled(v: Boolean) = setAutoSleepEnabled(v)
-
-    // xDrip prediction
-    fun enableXdripPrediction() = safeGetBoolean(K_XDRIP_ENABLED)
-    fun setEnableXdripPrediction(v: Boolean) = setBool(K_XDRIP_ENABLED, v)
-
-    /** Horizon in minutes (default 60). Callers clamp to 5..120. */
-    fun xdripHorizonMin(): Int = safeGetIntOrNull(K_XDRIP_HORIZON_MIN) ?: 60
-    fun setXdripHorizonMin(mins: Int) = p().edit { putInt(K_XDRIP_HORIZON_MIN, mins) }
 
     // Site context
     fun siteLocation(): String = safeGetString(K_SITE_LOCATION, "ABDOMEN")
@@ -364,10 +352,6 @@ object SippPrefs {
         put("manualSleepEndMin", manualSleepEndMin())
         put("autoSleepEnabled", autoSleepEnabled())
 
-        // xDrip prediction
-        put("xdripEnabled", enableXdripPrediction())
-        put("xdripHorizonMin", xdripHorizonMin())
-
         // live state
         loadState()?.let {
             put("state_diaH", it.diaH.toDouble())
@@ -423,10 +407,6 @@ object SippPrefs {
         setManualSleepStartMin(obj.optInt("manualSleepStartMin", manualSleepStartMin()))
         setManualSleepEndMin(obj.optInt("manualSleepEndMin", manualSleepEndMin()))
         setAutoSleepEnabled(obj.optBoolean("autoSleepEnabled", autoSleepEnabled()))
-
-        // xDrip prediction
-        setEnableXdripPrediction(obj.optBoolean("xdripEnabled", enableXdripPrediction()))
-        setXdripHorizonMin(obj.optInt("xdripHorizonMin", xdripHorizonMin()))
 
         // live state
         val dia = obj.optDouble("state_diaH", Double.NaN)
