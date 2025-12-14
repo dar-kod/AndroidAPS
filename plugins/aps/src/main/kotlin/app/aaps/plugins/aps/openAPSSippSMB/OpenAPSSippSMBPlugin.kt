@@ -3,11 +3,9 @@ package app.aaps.plugins.aps.openAPSSippSMB
 import android.content.Context
 import android.content.Intent
 import android.util.LongSparseArray
-import androidx.core.content.edit
 import androidx.core.net.toUri
 import androidx.core.util.forEach
 import androidx.core.util.size
-import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceCategory
 import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.PreferenceManager
@@ -120,17 +118,18 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         .mainType(PluginType.APS)
         .fragmentClass(OpenAPSFragment::class.java.name)
         .pluginIcon(app.aaps.core.ui.R.drawable.ic_generic_icon)
-        .pluginName(R.string.sipp_smb_shortname)
+        .pluginName(R.string.openapssippsmb)
         .shortName(R.string.sipp_smb_shortname)
         .preferencesId(PluginDescription.PREFERENCE_SCREEN)
         .preferencesVisibleInSimpleMode(false)
         .showInList(showInList = { config.APS })
-        .description(R.string.description_smb)
+        .description(R.string.description_sipp_smb)
         .setDefault(),
     loggerParam, rh
 ), APS, PluginConstraints {
 
-    var lastGuardHorizon: Int = 0
+    var lastSippGuardHighMinutes: Int = 0
+    var lastSippGuardLowMinutes: Int = 0
 
     private class LocalBooleanKey(
         override val key: String,
@@ -139,14 +138,16 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         override val exportable = true
     }
 
-    private val SippEnableGuard = LocalBooleanKey("sipp_enable_guard", true)
+    private val sippEnableGuard = LocalBooleanKey("sipp_enable_guard", true)
 
     private data class SippGuardSignals(
-        val guardHorizonMinutes: Int,
-        val sippHighBG: Double?, // highest predicted BG across all sources within horizon
-        val sippLowBG: Double?   // lowest predicted BG across all sources within horizon
+        val sippGuardHighMinutes: Int,  // horizon for high-BG scanning (minutes)
+        val sippGuardLowMinutes: Int,   // horizon for low-BG scanning (minutes)
+        val sippHighBG: Double?,        // highest predicted BG across sources in high horizon
+        val sippLowBG: Double?          // lowest predicted BG across sources in low horizon
     )
 
+    @Suppress("KotlinConstantConditions")
     private fun computeSippGuardSignals(
         sippPeakMinutes: Int,
         iobPredBGs: List<Double>?,
@@ -156,45 +157,67 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         var highBG: Double? = null
         var lowBG: Double? = null
 
-        // Helper to scan a curve for min/max within the guard horizon
-        fun scanCurve(curve: List<Double>, guardHorizonMinutes: Int): Pair<Double?, Double?> {
+        // Helper to scan a curve for max within a horizon
+        fun scanCurveHigh(curve: List<Double>, horizonMinutes: Int): Double? {
             var curveHighBG: Double? = null
-            var curveLowBG: Double? = null
-            val maxIndex = guardHorizonMinutes / 5
+            val maxIndex = horizonMinutes / 5
             for (i in 0 until min(curve.size, maxIndex)) {
                 val bg = curve[i]
                 if (curveHighBG == null || bg > curveHighBG) curveHighBG = bg
-                if (curveLowBG == null || bg < curveLowBG) curveLowBG = bg
             }
-            return Pair(curveHighBG, curveLowBG)
+            return curveHighBG
         }
 
-        // 1. Determine guard horizon based on Peak Time (same as PeakMatch logic)
-        // Peak 75m -> 90m horizon. Peak 55m -> 110m horizon?
-        // Actually using the simple mapping from PeakMatch:
-        // horizon = 270 - 2 * peak. Clamped 90..180.
-        // e.g. Peak 90 -> 90m. Peak 45 -> 180m.
-        val guardHorizonMinutes = (270 - 2 * sippPeakMinutes).coerceIn(90, 180)
-        lastGuardHorizon = guardHorizonMinutes
+        // Helper to scan a curve for min within a horizon
+        fun scanCurveLow(curve: List<Double>, horizonMinutes: Int): Double? {
+            var curveLowBG: Double? = null
+            val maxIndex = horizonMinutes / 5
+            for (i in 0 until min(curve.size, maxIndex)) {
+                val bg = curve[i]
+                if (curveLowBG == null || bg < curveLowBG) curveLowBG = bg
+            }
+            return curveLowBG
+        }
 
-        // 2. Scan curves (IOB, COB, UAM)
+        // 1. Determine separate horizons for high and low guards
+        // High-BG guard horizon: peak + 30 min, clamped to prediction horizon (4 h)
+        val sippGuardHighMinutes = (sippPeakMinutes + 30).coerceIn(120, 240)
+        // Low-BG guard horizon: ~2×peak, but never shorter than 120 min
+        // and never longer than the 4 h prediction window
+        val sippGuardLowMinutes = (2 * sippPeakMinutes).coerceIn(120, 240)
+
+        // Track for diagnostics / display
+        lastSippGuardHighMinutes = sippGuardHighMinutes
+        lastSippGuardLowMinutes = sippGuardLowMinutes
+
+        // 2. Scan curves (IOB, COB, UAM) with separate horizons for high and low
+        // Note: highBG/lowBG start as null and are updated via sentinel comparisons.
+        // The IDE warning about "always null" refers to the first iteration only.
         if (iobPredBGs != null) {
-            val (h, l) = scanCurve(iobPredBGs, guardHorizonMinutes)
+            val h = scanCurveHigh(iobPredBGs, sippGuardHighMinutes)
+            val l = scanCurveLow(iobPredBGs, sippGuardLowMinutes)
             if (h != null) highBG = max(highBG ?: -999.0, h)
             if (l != null) lowBG = min(lowBG ?: 999.0, l)
         }
         if (cobPredBGs != null) {
-            val (h, l) = scanCurve(cobPredBGs, guardHorizonMinutes)
+            val h = scanCurveHigh(cobPredBGs, sippGuardHighMinutes)
+            val l = scanCurveLow(cobPredBGs, sippGuardLowMinutes)
             if (h != null) highBG = max(highBG ?: -999.0, h)
             if (l != null) lowBG = min(lowBG ?: 999.0, l)
         }
         if (uamPredBGs != null) {
-            val (h, l) = scanCurve(uamPredBGs, guardHorizonMinutes)
+            val h = scanCurveHigh(uamPredBGs, sippGuardHighMinutes)
+            val l = scanCurveLow(uamPredBGs, sippGuardLowMinutes)
             if (h != null) highBG = max(highBG ?: -999.0, h)
             if (l != null) lowBG = min(lowBG ?: 999.0, l)
         }
 
-        return SippGuardSignals(guardHorizonMinutes, highBG, lowBG)
+        return SippGuardSignals(
+            sippGuardHighMinutes = sippGuardHighMinutes,
+            sippGuardLowMinutes = sippGuardLowMinutes,
+            sippHighBG = highBG,
+            sippLowBG = lowBG
+        )
     }
 
     // ===== Adaptive + safety defaults =====
@@ -540,14 +563,12 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             return
         }
 
-
-        val profile = profileAny
         val inputConstraints = ConstraintObject(0.0, aapsLogger)
 
-        if (!hardLimits.checkHardLimits(profile.dia, app.aaps.core.ui.R.string.profile_dia, hardLimits.minDia(), hardLimits.maxDia())) return
-        if (!hardLimits.checkHardLimits(profile.getIcTimeFromMidnight(MidnightUtils.secondsFromMidnight()), app.aaps.core.ui.R.string.profile_carbs_ratio_value, hardLimits.minIC(), hardLimits.maxIC())) return
-        if (!hardLimits.checkHardLimits(profile.getIsfMgdl("OpenAPSSMBPlugin"), app.aaps.core.ui.R.string.profile_sensitivity_value, HardLimits.MIN_ISF, HardLimits.MAX_ISF)) return
-        if (!hardLimits.checkHardLimits(profile.getMaxDailyBasal(), app.aaps.core.ui.R.string.profile_max_daily_basal_value, 0.02, hardLimits.maxBasal())) return
+        if (!hardLimits.checkHardLimits(profileAny.dia, app.aaps.core.ui.R.string.profile_dia, hardLimits.minDia(), hardLimits.maxDia())) return
+        if (!hardLimits.checkHardLimits(profileAny.getIcTimeFromMidnight(MidnightUtils.secondsFromMidnight()), app.aaps.core.ui.R.string.profile_carbs_ratio_value, hardLimits.minIC(), hardLimits.maxIC())) return
+        if (!hardLimits.checkHardLimits(profileAny.getIsfMgdl("OpenAPSSMBPlugin"), app.aaps.core.ui.R.string.profile_sensitivity_value, HardLimits.MIN_ISF, HardLimits.MAX_ISF)) return
+        if (!hardLimits.checkHardLimits(profileAny.getMaxDailyBasal(), app.aaps.core.ui.R.string.profile_max_daily_basal_value, 0.02, hardLimits.maxBasal())) return
         if (!hardLimits.checkHardLimits(pump.baseBasalRate, app.aaps.core.ui.R.string.current_basal_value, 0.01, hardLimits.maxBasal())) return
 
         val dynIsfMode =
@@ -564,14 +585,14 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         val tb = processedTbrEbData.getTempBasalIncludingConvertedExtended(now)
         val currentTemp = CurrentTemp(
             duration = tb?.plannedRemainingMinutes ?: 0,
-            rate = tb?.convertedToAbsolute(now, profile) ?: 0.0,
+            rate = tb?.convertedToAbsolute(now, profileAny) ?: 0.0,
             minutesrunning = tb?.getPassedDurationToTimeInMinutes(now)
         )
-        val scheduledBasal: Double = profile.getBasal()
+        val scheduledBasal: Double = profileAny.getBasal()
 
-        var minBg = hardLimits.verifyHardLimits(Round.roundTo(profile.getTargetLowMgdl(), 0.1), app.aaps.core.ui.R.string.profile_low_target, HardLimits.LIMIT_MIN_BG[0], HardLimits.LIMIT_MIN_BG[1])
-        var maxBg = hardLimits.verifyHardLimits(Round.roundTo(profile.getTargetHighMgdl(), 0.1), app.aaps.core.ui.R.string.profile_high_target, HardLimits.LIMIT_MAX_BG[0], HardLimits.LIMIT_MAX_BG[1])
-        var targetBg = hardLimits.verifyHardLimits(profile.getTargetMgdl(), app.aaps.core.ui.R.string.temp_target_value, HardLimits.LIMIT_TARGET_BG[0], HardLimits.LIMIT_TARGET_BG[1])
+        var minBg = hardLimits.verifyHardLimits(Round.roundTo(profileAny.getTargetLowMgdl(), 0.1), app.aaps.core.ui.R.string.profile_low_target, HardLimits.LIMIT_MIN_BG[0], HardLimits.LIMIT_MIN_BG[1])
+        var maxBg = hardLimits.verifyHardLimits(Round.roundTo(profileAny.getTargetHighMgdl(), 0.1), app.aaps.core.ui.R.string.profile_high_target, HardLimits.LIMIT_MAX_BG[0], HardLimits.LIMIT_MAX_BG[1])
+        var targetBg = hardLimits.verifyHardLimits(profileAny.getTargetMgdl(), app.aaps.core.ui.R.string.temp_target_value, HardLimits.LIMIT_TARGET_BG[0], HardLimits.LIMIT_TARGET_BG[1])
         var isTempTarget = false
         persistenceLayer.getTemporaryTargetActiveAt(dateUtil.now())?.let { tempTarget ->
             isTempTarget = true
@@ -633,7 +654,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             ((now - lastBolusMs) / 60000L).toInt()
         }.getOrElse { 9_999 }
 
-        val diaMin = (profile.dia * 60.0).toInt()
+        val diaMin = (profileAny.dia * 60.0).toInt()
         val lookbackTarget = (bolusLookbackPerDiaFrac * diaMin).toInt()
         val bolusLookbackMinReq = lookbackTarget.coerceIn(bolusLookbackMin, bolusLookbackMax)
         if (minutesSinceLastBolus < bolusLookbackMinReq) reasons += "bolus<${bolusLookbackMinReq}min (was ${minutesSinceLastBolus}min)"
@@ -643,7 +664,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         val per30uThresh = (bolusSumPer30MinPerTdd * tdd7d).coerceIn(bolusSumPer30MinMin, bolusSumPer30MinMax)
         if (last1hIns >= 2.0 * per30uThresh) reasons += "insulinLoad1h≥${"%.2f".format(2.0 * per30uThresh)}U (was ${"%.2f".format(last1hIns)}U)"
 
-        val deliveredBasalNow = tb?.convertedToAbsolute(now, profile) ?: activePlugin.activePump.baseBasalRate
+        val deliveredBasalNow = tb?.convertedToAbsolute(now, profileAny) ?: activePlugin.activePump.baseBasalRate
         val minutesRunning = tb?.getPassedDurationToTimeInMinutes(now) ?: 0
         if (deliveredBasalNow >= basalExcessRatio * scheduledBasal) {
             reasons += "basal≥${(basalExcessRatio * 100).toInt()}% sched (rate=${"%.2f".format(deliveredBasalNow)}U/h, sched=${"%.2f".format(scheduledBasal)}U/h)"
@@ -676,7 +697,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
                     "RAPID"   -> 5.0f to 75
                     "FIASP"   -> 4.0f to 60
                     "LYUMJEV" -> 3.5f to 50
-                    else      -> profile.dia.toFloat() to preferences.get(IntKey.InsulinOrefPeak)
+                    else -> profileAny.dia.toFloat() to preferences.get(IntKey.InsulinOrefPeak)
                 }
 
                 sentinelController.applyEvidence(
@@ -697,7 +718,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             }.onFailure { /* never let SIPP crash dosing */ }
         }
 
-        val baseIsfMgdl: Double = profile.getIsfMgdl("OpenAPSSMBPlugin")
+        val baseIsfMgdl: Double = profileAny.getIsfMgdl("OpenAPSSMBPlugin")
         val dsPair = calculateVariableIsf(now, epsMultiplier)
         val dsIsf: Double? = dsPair.second
         val sippIsf: Double? = if (SippPrefs.enableIsf()) dynIsfResult.variableSensitivity else null
@@ -708,14 +729,14 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             else                                                                                 -> baseIsfMgdl
         }
 
-        runCatching { SippPrefs.saveLastInstantIsfMgdl(sensForJs, now, glucoseStatus.glucose, profile.getTargetLowMgdl()) }
+        runCatching { SippPrefs.saveLastInstantIsfMgdl(sensForJs, now, glucoseStatus.glucose, profileAny.getTargetLowMgdl()) }
         runCatching { if (dsIsf != null && dsIsf > 0.0) SippPrefs.saveLastRawInstantIsfMgdl(dsIsf, now) }
 
         if ((SippPrefs.enableBasal() || SippPrefs.enableMaxBasal())) {
             synthesizeIfMissing(
-                profile = profile,
+                profile = profileAny,
                 usedIsfMgdl = sensForJs,
-                deliveredBasalNow = tb?.convertedToAbsolute(now, profile) ?: activePlugin.activePump.baseBasalRate,
+                deliveredBasalNow = tb?.convertedToAbsolute(now, profileAny) ?: activePlugin.activePump.baseBasalRate,
                 minutesRunning = tb?.getPassedDurationToTimeInMinutes(now) ?: 0,
                 minBg = minBg,
                 isTempTarget = isTempTarget
@@ -732,7 +753,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
                 sippInstantBasal.coerceAtMost(hardLimits.maxBasal())
             sippInstantBasal != null && sippInstantBasal > 0.0 && basalAge in 16..60 -> {
                 val frac = (basalAge - 15).toDouble() / (60 - 15).toDouble()
-                val decayed = sippInstantBasal + (profile.getBasal() - sippInstantBasal) * frac
+                val decayed = sippInstantBasal + (profileAny.getBasal() - sippInstantBasal) * frac
                 decayed.coerceAtMost(hardLimits.maxBasal())
             }
 
@@ -742,7 +763,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         val sippMaxBasalForJs = if (SippPrefs.enableMaxBasal()) SippPrefs.lastMaxBasalUph() else null
         val sippMaxBasalTs = SippPrefs.lastMaxBasalTsMs() ?: 0L
         val maxAge = ageMin(sippMaxBasalTs)
-        val constrainedMax = constraintsChecker.getMaxBasalAllowed(profile).also { inputConstraints.copyReasons(it) }.value()
+        val constrainedMax = constraintsChecker.getMaxBasalAllowed(profileAny).also { inputConstraints.copyReasons(it) }.value()
         val maxBasalForJs = when {
             sippMaxBasalForJs != null && sippMaxBasalForJs > 0.0 && maxAge <= 15 ->
                 sippMaxBasalForJs.coerceAtMost(hardLimits.maxBasal())
@@ -760,12 +781,12 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             dia = 0.0,
             min_5m_carbimpact = 0.0,
             max_iob = constraintsChecker.getMaxIOBAllowed().also { inputConstraints.copyReasons(it) }.value(),
-            max_daily_basal = profile.getMaxDailyBasal(),
+            max_daily_basal = profileAny.getMaxDailyBasal(),
             max_basal = maxBasalForJs,
             min_bg = minBg,
             max_bg = maxBg,
             target_bg = targetBg,
-            carb_ratio = profile.getIc(),
+            carb_ratio = profileAny.getIc(),
             sens = sensForJs,
             autosens_adjust_targets = false,
             max_daily_safety_multiplier = preferences.get(DoubleKey.ApsMaxDailyMultiplier),
@@ -827,12 +848,21 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             val basalStr = instantBasal?.takeIf { it > 0.0 }?.let { fmt2(it) } ?: "—"
             val maxBasalStr = instantMaxBasal?.takeIf { it > 0.0 }?.let { fmt2(it) } ?: "—"
 
-            val bannerText =
-                "SIPP → DIA: ${fmt2(diaH)} h | " +
-                    "Peak Time: $peakMin min | " +
-                    "ISF: ${fmt2(displayIsf)} $isfUnit | " +
-                    "Instant Basal: $basalStr U/h | " +
-                    "Instant Max Basal: $maxBasalStr U/h"
+            val guardStateStr = if (!preferences.get(sippEnableGuard) || (lastSippGuardHighMinutes == 0 && lastSippGuardLowMinutes == 0))
+                rh.gs(R.string.sipp_guard_state_off)
+            else
+                rh.gs(R.string.sipp_guard_state_on, lastSippGuardHighMinutes, lastSippGuardLowMinutes)
+
+            val bannerText = rh.gs(
+                R.string.sipp_banner_format,
+                fmt2(diaH),
+                peakMin,
+                fmt2(displayIsf),
+                isfUnit,
+                basalStr,
+                maxBasalStr,
+                guardStateStr
+            )
 
             val banner = ConstraintObject(0.0, aapsLogger).apply {
                 addReason(bannerText, this@OpenAPSSippSMBPlugin)
@@ -866,7 +896,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         
         val isSleepState = isManualSleep || isAutoSleep
 
-        val determineBasalResult = determineBasalSMB.determine_basal(
+        determineBasalSMB.determine_basal(
             glucose_status = glucoseStatus,
             currenttemp = currentTemp,
             iob_data_array = iobArray,
@@ -890,7 +920,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             determineBasalResult.mealData = mealData
 
             // SIPP GUARD (Brake Only - uses AAPS predictions only)
-            val enableGuard = preferences.get(SippEnableGuard)
+            val enableGuard = preferences.get(sippEnableGuard)
 
             if (enableGuard) {
                 val guardSignals = computeSippGuardSignals(
@@ -907,20 +937,32 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
 
                 if (sippLowBG != null && sippLowBG < safeLowThreshold) {
                     // BRAKE!
-                    it.reason.append(" SIPP Guard: predicted low (${fmt2(sippLowBG)} < ${fmt2(safeLowThreshold)}).")
-                    it.rate = kotlin.math.min(it.rate ?: 0.0, oapsProfile.current_basal)
-                    it.reason.append(" SMB disabled.")
-                    it.reason.append(" SMB disabled.")
+                    it.reason.append(" ")
+                    it.reason.append(rh.gs(R.string.sipp_guard_reason_predicted_low, sippLowBG.roundToInt(), safeLowThreshold.toInt(), guardSignals.sippGuardLowMinutes))
+                    val sippInstantBasalForGuard = if (SippPrefs.enableBasal()) SippPrefs.lastInstantBasalUph() else null
+                    val guardCapBasal = sippInstantBasalForGuard ?: oapsProfile.current_basal
+                    it.rate = min(it.rate ?: 0.0, guardCapBasal)
+                    it.units = null  // Block SMB delivery
+                    it.reason.append(" ")
+                    it.reason.append(rh.gs(R.string.sipp_smb_disabled))
                 }
+
+                // SIPP Hard Low Guard: immediate full suspend based on current BG
+                val currentBg = glucoseStatus.glucose
+                if (currentBg < safeLowThreshold) {
+                    it.reason.append(" ")
+                    it.reason.append(rh.gs(R.string.sipp_hard_low_reason, currentBg.roundToInt(), safeLowThreshold.toInt()))
+                    it.rate = 0.0
+                    it.units = null
                 }
+            }
             lastAPSResult = determineBasalResult
             lastAPSRun = now
             aapsLogger.debug(LTag.APS, "Result: $determineBasalResult")
             rxBus.send(EventAPSCalculationFinished())
-
-        rxBus.send(EventOpenAPSUpdateGui())
+            rxBus.send(EventOpenAPSUpdateGui())
         }
-        }
+    }
 
     override fun getGlucoseStatusData(allowOldData: Boolean): GlucoseStatus? =
         glucoseStatusCalculatorSMB.getGlucoseStatusData(allowOldData)
@@ -988,7 +1030,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             // Apply SIPP Max Basal (effective/decayed) with half-up rounding in the message.
             effectiveSippMaxBasalForConstraints(profile)?.let { eff ->
                 val effRounded = round2(eff)
-                val msg = "Limiting basal by SIPP Max Basal (${String.format(Locale.getDefault(), "%.2f", effRounded)} U/h)"
+                val msg = rh.gs(R.string.sipp_limiting_basal_by_max, String.format(Locale.getDefault(), "%.2f", effRounded))
                 absoluteRate.setIfSmaller(effRounded, msg, this)
             }
         }
@@ -1023,13 +1065,13 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         JSONObject()
             .put(BooleanKey.ApsUseDynamicSensitivity, preferences)
             .put(IntKey.ApsDynIsfAdjustmentFactor, preferences)
-            .put(SippEnableGuard, preferences)
+            .put(sippEnableGuard, preferences)
 
     override fun applyConfiguration(configuration: JSONObject) {
         configuration
             .store(BooleanKey.ApsUseDynamicSensitivity, preferences)
             .store(IntKey.ApsDynIsfAdjustmentFactor, preferences)
-            .store(SippEnableGuard, preferences)
+            .store(sippEnableGuard, preferences)
     }
 
     override fun addPreferenceScreen(
@@ -1038,128 +1080,269 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         context: Context,
         requiredKey: String?
     ) {
-        val resHelper = rh
         if (requiredKey != null && requiredKey != "absorption_smb_advanced") return
+
         val category = PreferenceCategory(context)
         parent.addPreference(category)
+
         category.apply {
             key = "openapssmb_settings"
-            title = resHelper.gs(R.string.openapssmb)
+            // Show it as SIPP SMB in the UI
+            title = rh.gs(R.string.openapssippsmb)
             initialExpandedChildrenCount = 0
+
+            // --- Standard SMB top-level settings (copied from OpenAPSSMB) ---
+
             addPreference(
-                SwitchPreference(context).apply {
-                    key = this@OpenAPSSippSMBPlugin.SippEnableGuard.key
-                    title = resHelper.gs(R.string.sipp_enable_guard)
-                    summary = resHelper.gs(R.string.sipp_enable_guard_summary)
-                    setDefaultValue(true)
-                }
+                AdaptiveDoublePreference(
+                    ctx = context,
+                    doubleKey = DoubleKey.ApsMaxBasal,
+                    dialogMessage = R.string.openapsma_max_basal_summary,
+                    title = R.string.openapsma_max_basal_title
+                )
             )
 
-//            addPreference(
-//                AdaptiveDoublePreference(
-//                    ctx = context,
-//                    doubleKey = DoubleKey.ApsMaxBasal,
-//                    dialogMessage = R.string.openapsma_max_basal_summary,
-//                    title = R.string.openapsma_max_basal_title
-//                )
-//            )
-//            addPreference(
-//                AdaptiveDoublePreference(
-//                    ctx = context,
-//                    doubleKey = DoubleKey.ApsMaxIOB,
-//                    dialogMessage = R.string.openapsma_max_iob_summary,
-//                    title = R.string.openapsma_max_iob_title
-//                )
-//            )
-//
-//            addPreference(
-//                AdaptiveSwitchPreference(
-//                    ctx = context,
-//                    booleanKey = BooleanKey.ApsUseSmb,
-//                    title = R.string.ns_enable_smb,
-//                    summary = R.string.ns_enable_smb_summary
-//                )
-//            )
-//
-//            addPreference(
-//                AdaptiveDoublePreference(
-//                    ctx = context,
-//                    doubleKey = DoubleKey.ApsMinBgSmb,
-//                    dialogMessage = R.string.min_bg_for_smb_summary,
-//                    title = R.string.min_bg_for_smb
-//                )
-//            )
-//            addPreference(
-//                AdaptiveDoublePreference(
-//                    ctx = context,
-//                    doubleKey = DoubleKey.ApsMaxSmzBasalMinutes,
-//                    dialogMessage = R.string.max_smb_basal_minutes_summary,
-//                    title = R.string.max_smb_basal_minutes
-//                )
-//            )
-
-//            addPreference(
-//                AdaptiveSwitchPreference(
-//                    ctx = context,
-//                    booleanKey = BooleanKey.ApsUseUam,
-//                    summary = R.string.ns_enable_uam_summary,
-//                    title = R.string.ns_enable_uam
-//                )
-//            )
-//
-//            addPreference(
-//                AdaptiveSwitchPreference(
-//                    ctx = context,
-//                    booleanKey = BooleanKey.ApsUseDynamicSensitivity,
-//                    summary = R.string.preferences_openaps_use_dynamic_sensitivity_summary,
-//                    title = R.string.preferences_openaps_use_dynamic_sensitivity
-//                )
-//            )
-//            addPreference(
-//                AdaptiveDoublePreference(
-//                    ctx = context,
-//                    intKey = IntKey.ApsDynIsfAdjustmentFactor,
-//                    dialogMessage = R.string.preferences_openaps_adjustment_factor_summary,
-//                    title = R.string.preferences_openaps_adjustment_factor
-//                )
-//            )
-//
-//            addPreference(
-//                AdaptiveSwitchPreference(
-//                    ctx = context,
-//                    booleanKey = BooleanKey.ApsUseAutosens,
-//                    summary = R.string.openapsama_enable_autosens_summary,
-//                    title = R.string.openapsama_enable_autosens
-//                )
-//            )
+            addPreference(
+                AdaptiveDoublePreference(
+                    ctx = context,
+                    doubleKey = DoubleKey.ApsSmbMaxIob,
+                    dialogMessage = R.string.openapssmb_max_iob_summary,
+                    title = R.string.openapssmb_max_iob_title
+                )
+            )
 
             addPreference(
                 AdaptiveSwitchPreference(
                     ctx = context,
-                    booleanKey = BooleanKey.ApsAlwaysUseShortDeltas,
-                    summary = R.string.always_use_short_avg_summary,
-                    title = R.string.always_use_short_avg
+                    booleanKey = BooleanKey.ApsUseDynamicSensitivity,
+                    summary = R.string.use_dynamic_sensitivity_summary,
+                    title = R.string.use_dynamic_sensitivity_title
                 )
             )
-            addPreference(
-                AdaptiveDoublePreference(
-                    ctx = context,
-                    doubleKey = DoubleKey.ApsMaxDailyMultiplier,
-                    dialogMessage = R.string.openapsama_max_daily_safety_multiplier_summary,
-                    title = R.string.openapsama_max_daily_safety_multiplier
-                )
-            )
-            addPreference(
-                AdaptiveDoublePreference(
-                    ctx = context,
-                    doubleKey = DoubleKey.ApsMaxCurrentBasalMultiplier,
-                    dialogMessage = R.string.openapsama_current_basal_safety_multiplier_summary,
-                    title = R.string.openapsama_current_basal_safety_multiplier
-                )
-            )
-        } // Close apply
-    } // Close addPreferenceScreen
 
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseAutosens,
+                    title = R.string.openapsama_use_autosens
+                )
+            )
+
+            addPreference(
+                AdaptiveIntPreference(
+                    ctx = context,
+                    intKey = IntKey.ApsDynIsfAdjustmentFactor,
+                    dialogMessage = R.string.dyn_isf_adjust_summary,
+                    title = R.string.dyn_isf_adjust_title
+                )
+            )
+
+            addPreference(
+                AdaptiveUnitPreference(
+                    ctx = context,
+                    unitKey = UnitDoubleKey.ApsLgsThreshold,
+                    dialogMessage = R.string.lgs_threshold_summary,
+                    title = R.string.lgs_threshold_title
+                )
+            )
+
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsDynIsfAdjustSensitivity,
+                    summary = R.string.dynisf_adjust_sensitivity_summary,
+                    title = R.string.dynisf_adjust_sensitivity
+                )
+            )
+
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsSensitivityRaisesTarget,
+                    summary = R.string.sensitivity_raises_target_summary,
+                    title = R.string.sensitivity_raises_target_title
+                )
+            )
+
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsResistanceLowersTarget,
+                    summary = R.string.resistance_lowers_target_summary,
+                    title = R.string.resistance_lowers_target_title
+                )
+            )
+
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmb,
+                    summary = R.string.enable_smb_summary,
+                    title = R.string.enable_smb
+                )
+            )
+
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmbWithHighTt,
+                    summary = R.string.enable_smb_with_high_temp_target_summary,
+                    title = R.string.enable_smb_with_high_temp_target
+                )
+            )
+
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmbAlways,
+                    summary = R.string.enable_smb_always_summary,
+                    title = R.string.enable_smb_always
+                )
+            )
+
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmbWithCob,
+                    summary = R.string.enable_smb_with_cob_summary,
+                    title = R.string.enable_smb_with_cob
+                )
+            )
+
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmbWithLowTt,
+                    summary = R.string.enable_smb_with_temp_target_summary,
+                    title = R.string.enable_smb_with_temp_target
+                )
+            )
+
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseSmbAfterCarbs,
+                    summary = R.string.enable_smb_after_carbs_summary,
+                    title = R.string.enable_smb_after_carbs
+                )
+            )
+
+            addPreference(
+                AdaptiveIntPreference(
+                    ctx = context,
+                    intKey = IntKey.ApsMaxSmbFrequency,
+                    title = R.string.smb_interval_summary
+                )
+            )
+
+            addPreference(
+                AdaptiveIntPreference(
+                    ctx = context,
+                    intKey = IntKey.ApsMaxMinutesOfBasalToLimitSmb,
+                    title = R.string.smb_max_minutes_summary
+                )
+            )
+
+            addPreference(
+                AdaptiveIntPreference(
+                    ctx = context,
+                    intKey = IntKey.ApsUamMaxMinutesOfBasalToLimitSmb,
+                    dialogMessage = R.string.uam_smb_max_minutes,
+                    title = R.string.uam_smb_max_minutes_summary
+                )
+            )
+
+            addPreference(
+                AdaptiveSwitchPreference(
+                    ctx = context,
+                    booleanKey = BooleanKey.ApsUseUam,
+                    summary = R.string.enable_uam_summary,
+                    title = R.string.enable_uam
+                )
+            )
+
+            addPreference(
+                AdaptiveIntPreference(
+                    ctx = context,
+                    intKey = IntKey.ApsCarbsRequestThreshold,
+                    dialogMessage = R.string.carbs_req_threshold_summary,
+                    title = R.string.carbs_req_threshold
+                )
+            )
+
+            // --- Advanced sub-screen (this brings back the “Attention! CLICK HERE …” text) ---
+            addPreference(
+                preferenceManager.createPreferenceScreen(context).apply {
+                    key = "absorption_smb_advanced"
+                    title = rh.gs(app.aaps.core.ui.R.string.advanced_settings_title)
+
+                    // The “CLICK HERE and READ” doc link
+                    addPreference(
+                        AdaptiveIntentPreference(
+                            ctx = context,
+                            intentKey = IntentKey.ApsLinkToDocs,
+                            intent = Intent().apply {
+                                action = Intent.ACTION_VIEW
+                                data = rh.gs(R.string.openapsama_link_to_preference_json_doc).toUri()
+                            },
+                            summary = R.string.openapsama_link_to_preference_json_doc_txt
+                        )
+                    )
+
+                    addPreference(
+                        AdaptiveSwitchPreference(
+                            ctx = context,
+                            booleanKey = BooleanKey.ApsAlwaysUseShortDeltas,
+                            summary = R.string.always_use_short_avg_summary,
+                            title = R.string.always_use_short_avg
+                        )
+                    )
+
+                    addPreference(
+                        AdaptiveDoublePreference(
+                            ctx = context,
+                            doubleKey = DoubleKey.ApsMaxDailyMultiplier,
+                            dialogMessage = R.string.openapsama_max_daily_safety_multiplier_summary,
+                            title = R.string.openapsama_max_daily_safety_multiplier
+                        )
+                    )
+
+                    addPreference(
+                        AdaptiveDoublePreference(
+                            ctx = context,
+                            doubleKey = DoubleKey.ApsMaxCurrentBasalMultiplier,
+                            dialogMessage = R.string.openapsama_current_basal_safety_multiplier_summary,
+                            title = R.string.openapsama_current_basal_safety_multiplier
+                        )
+                    )
+
+                    // SIPP GUARD toggle at the BOTTOM of Advanced section
+                    val guardToggle = SwitchPreference(context).apply {
+                        key = this@OpenAPSSippSMBPlugin.sippEnableGuard.key
+                        title = rh.gs(R.string.sipp_enable_guard)
+                        summary = rh.gs(R.string.sipp_enable_guard_summary)
+                        setDefaultValue(true)
+                    }
+                    addPreference(guardToggle)
+
+                    // SIPP Guard horizons display (read-only)
+                    val guardHorizonPref = androidx.preference.Preference(context).apply {
+                        title = rh.gs(R.string.sipp_guard_horizon_label, lastSippGuardHighMinutes, lastSippGuardLowMinutes)
+                        isSelectable = false
+                    }
+                    val guardEnabled = preferences.get(sippEnableGuard)
+                    guardHorizonPref.isVisible = guardEnabled
+                    guardToggle.setOnPreferenceChangeListener { _, newValue ->
+                        guardHorizonPref.isVisible = newValue as Boolean
+                        true
+                    }
+                    addPreference(guardHorizonPref)
+                }
+            )
+        }
+    }
+
+    @Suppress("ConvertTwoComparisonsToRangeCheck")
     private fun isNowInWindow(startMin: Int, endMin: Int): Boolean {
         val now = java.util.Calendar.getInstance()
         val nowMin = now.get(java.util.Calendar.HOUR_OF_DAY) * 60 + now.get(java.util.Calendar.MINUTE)

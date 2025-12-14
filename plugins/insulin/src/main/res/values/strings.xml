@@ -15,7 +15,82 @@
     <string name="dia_too_short">DIA of %1$f too short - using %2$f instead!</string>
     <string name="fast_acting_insulin_comment">Novorapid, Novolog, Humalog</string>
     <string name="ultra_fast_acting_insulin_comment">Fiasp</string>
-    <string name="sipp_instant_insulin">SIPP Instant PKPD</string>
-    <string name="description_insulin_sipp_instant">Insulin preset driven by Sentinel PK and PD, adjusting in real time to infusion site, sleep and activity.</string>
+    <string name="sipp_instant_insulin">SIPP Instant PK/PD</string>
+    <string name="description_insulin_sipp_instant">Insulin preset powered by Sentinel Instant PK/PD — computes insulin action parameters in real time.</string>
+
+    <!-- SIPP Preferences - Main Category -->
+    <string name="sipp_category_title">SIPP (Sentinel Instant PK/PD)</string>
+    <string name="sipp_archetype_title">Insulin archetype for SIPP seeding</string>
+    <string name="sipp_archetype_auto">AUTO (use current preset)</string>
+    <string name="sipp_archetype_rapid">Rapid-acting (Humalog / NovoRapid)</string>
+    <string name="sipp_archetype_fiasp">Ultra-rapid (Fiasp)</string>
+    <string name="sipp_archetype_lyumjev">Lyumjev</string>
+    <string name="sipp_archetype_current_auto">Current: AUTO (use current preset)</string>
+    <string name="sipp_archetype_current_rapid">Current: Rapid-acting (Humalog / NovoRapid)</string>
+    <string name="sipp_archetype_current_fiasp">Current: Ultra-rapid (Fiasp)</string>
+    <string name="sipp_archetype_current_lyumjev">Current: Lyumjev</string>
+    <string name="sipp_enable_pk_title">Enable SIPP PK</string>
+    <string name="sipp_enable_pk_summary">Auto-tune DIA and peak time within safety rails.</string>
+    <string name="sipp_enable_isf_title">Enable SIPP PD</string>
+    <string name="sipp_enable_isf_summary">Uses Instant ISF from an exponentially weighted TDD.</string>
+    <string name="sipp_allow_dia_above_9h_title">Allow DIA &gt; 9 h</string>
+    <string name="sipp_allow_dia_above_9h_summary">Advanced: allows DIA up to 24 h for slow absorption and stacking.</string>
+
+    <!-- SIPP Preferences - Sleep Category -->
+    <string name="sipp_sleep_category_title">SIPP – Sleep</string>
+    <string name="sipp_sleep_aware_dia_title">Sleep-aware DIA</string>
+    <string name="sipp_sleep_aware_dia_summary">Apply gentler DIA ceiling during sleep.</string>
+    <string name="sipp_auto_sleep_title">Auto sleep (watch HR \u0026 steps)</string>
+    <string name="sipp_auto_sleep_summary">Detect sleep from low HR, no cadence, sustained inactivity.</string>
+    <string name="sipp_manual_sleep_title">Manual sleep window</string>
+    <string name="sipp_manual_sleep_summary">Use fixed times when no wearable sleep signal is present.</string>
+    <string name="sipp_sleep_start_title">Sleep window start (HH:MM)</string>
+    <string name="sipp_sleep_end_title">Sleep window end (HH:MM)</string>
+    <string name="sipp_sleep_time_summary">Current: %1$s (%2$d min)</string>
+
+    <!-- SIPP Preferences - Dosing Rails -->
+    <string name="sipp_enable_basal_title">Apply SIPP Instant Basal</string>
+    <string name="sipp_enable_basal_summary">Use SIPP\'s calculated basal (from Used ISF) as the current basal input.</string>
+    <string name="sipp_enable_max_basal_title">Apply SIPP Max Temp Basal cap</string>
+    <string name="sipp_enable_max_basal_summary">Limit temp basals to SIPP\'s suggested maximum.</string>
+
+    <!-- SIPP Preferences - Site Context -->
+    <string name="sipp_site_location_title">Infusion site</string>
+    <string name="sipp_site_location_abdomen">Abdomen</string>
+    <string name="sipp_site_location_arm">Arm</string>
+    <string name="sipp_site_location_thigh">Thigh</string>
+    <string name="sipp_site_location_current">Current: %1$s</string>
+    <string name="sipp_site_age_enabled_title">Use infusion site aging</string>
+    <string name="sipp_site_age_enabled_summary">Advanced: uses site age to adjust insulin action estimates. Anecdotal: often reported with Omnipod; less often with Medtrum.</string>
+    <string name="sipp_site_age_title">Site Age (hours)</string>
+    <string name="sipp_site_age_dialog">Enter hours since insertion</string>
+    <string name="sipp_site_age_current">Current: %1$s</string>
+
+    <!-- SIPP Preferences - Live Readouts -->
+    <string name="sipp_readout_dia">DIA</string>
+    <string name="sipp_readout_peak">Peak Time</string>
+    <string name="sipp_readout_isf">ISF</string>
+    <string name="sipp_readout_basal">Basal (U/h)</string>
+    <string name="sipp_readout_max_basal">Max Basal (U/h)</string>
+    <string name="sipp_readout_verification">Verification</string>
+    <string name="sipp_readout_instant_profile">Instant (SIPP): %1$s   |   Profile: %2$s</string>
+    <string name="sipp_readout_instant_pref">Instant (SIPP): %1$s   |   Pref: %2$s</string>
+    <string name="sipp_readout_instant_na">Instant (SIPP): —   |   Profile: %1$s</string>
+    <string name="sipp_readout_instant_na_pref">Instant (SIPP): —   |   Pref: %1$s</string>
+    <string name="sipp_readout_both_na">Instant (SIPP): — | Profile: —</string>
+    <string name="sipp_readout_diag">Confidence: %1$s  |  RMSE: %2$s  |  Bias: %3$s</string>
+    <string name="sipp_readout_diag_na">Confidence: —  |  RMSE: —  |  Bias: —</string>
+
+    <!-- SIPP Preferences - Activity Signals -->
+    <string name="sipp_activity_signals_category_title">SIPP – Activity signals</string>
+    <string name="sipp_activity_signals_title">Use activity signals</string>
+    <string name="sipp_activity_signals_summary">Uses wearable heart rate and step cadence. Small, capped ISF weakening (+3–12%) and up to +10 min peak shift; DIA never shortened.</string>
+    <string name="sipp_use_hr_title">Use heart rate</string>
+    <string name="sipp_use_hr_summary">Treat HR ≥100 bpm as activity (adds small, capped ISF weakening).</string>
+    <string name="sipp_use_steps_title">Use steps (cadence)</string>
+    <string name="sipp_use_steps_summary">Active when ≥60 steps/min for ≥5 min.</string>
+    <string name="sipp_activity_evidence_title">Activity evidence</string>
+    <string name="sipp_activity_summary">Signals: %1$s  |  Toggles: hr=%2$s, steps=%3$s  |  HR: %4$s bpm  |  SPM: %5$s  |  Sustained: %6$sm  |  Active: %7$s  |  ISF: %8$s  |  Peak: %9$s</string>
+    <string name="sipp_activity_summary_na">Signals: —  |  Toggles: —  |  HR: —  |  SPM: —  |  Sustained: —  |  Active: —  |  ISF: —  |  Peak: —</string>
 
 </resources>
