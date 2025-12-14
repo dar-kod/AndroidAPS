@@ -96,8 +96,8 @@ object SippPrefs {
     // Insulin archetype
     private const val K_INSULIN_ARCHETYPE = "SIPP_insulin_archetype" // "AUTO"|"RAPID"|"FIASP"|"LYUMJEV"
 
-    // Activity fusion
-    private const val K_ENABLE_ACTIVITY = "SIPP_enable_activity_fusion"
+    // Activity signals
+    private const val K_ENABLE_ACTIVITY = "SIPP_enable_activity_signals"
     private const val K_USE_HR = "SIPP_use_hr"
     private const val K_USE_STEPS = "SIPP_use_steps"
 
