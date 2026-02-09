@@ -6,6 +6,7 @@ import androidx.core.content.edit
 import androidx.preference.PreferenceManager
 import org.json.JSONObject
 import java.lang.ref.WeakReference
+import java.util.Locale
 
 /**
  * SIPP local preferences & lightweight state.
@@ -137,6 +138,13 @@ object SippPrefs {
     private const val K_LAST_SUSTAIN_MIN = "SIPP_last_activity_window_min"
     private const val K_LAST_STEPS_TS = "SIPP_last_steps_ts"
 
+    // ===== SIPP SMB caps (absolute units; OpenAPSSippSMB) =====
+    const val KEY_SMB_MAX_BOLUS_U = "SIPP_smb_max_bolus_u"
+    const val KEY_UAM_SMB_MAX_BOLUS_U = "SIPP_uam_smb_max_bolus_u"
+    private const val DEF_SMB_MAX_BOLUS_U = 0.5
+    private const val DEF_UAM_SMB_MAX_BOLUS_U = 0.3
+    private const val MAX_SMB_MAX_BOLUS_U = 25.0
+
     // ===== helpers =====
     private fun p(): SharedPreferences = requireReady()
 
@@ -175,8 +183,34 @@ object SippPrefs {
             p().edit { remove(k) }; null
         }
 
+    private fun safeGetDoubleFromString(k: String, def: Double): Double =
+        try {
+            val s = p().getString(k, null)
+            val v = s?.trim()?.replace(',', '.')?.toDoubleOrNull()
+            if (v != null && v.isFinite()) v else def
+        } catch (_: ClassCastException) {
+            p().edit { remove(k) }; def
+        }
+
+    private fun setDoubleString(k: String, v: Double, max: Double = MAX_SMB_MAX_BOLUS_U, digits: Int = 2) {
+        val vv = v.coerceIn(0.0, max)
+        val fmt = "%.${digits}f"
+        p().edit { putString(k, String.format(Locale.US, fmt, vv)) }
+    }
+
     private fun setBool(k: String, v: Boolean) = p().edit { putBoolean(k, v) }
     private fun setString(k: String, v: String) = p().edit { putString(k, v) }
+
+    // ===== SIPP SMB caps (U) =====
+    fun smbMaxBolusU(): Double = safeGetDoubleFromString(KEY_SMB_MAX_BOLUS_U, DEF_SMB_MAX_BOLUS_U)
+        .coerceIn(0.0, MAX_SMB_MAX_BOLUS_U)
+
+    fun setSmbMaxBolusU(v: Double) = setDoubleString(KEY_SMB_MAX_BOLUS_U, v)
+
+    fun uamSmbMaxBolusU(): Double = safeGetDoubleFromString(KEY_UAM_SMB_MAX_BOLUS_U, DEF_UAM_SMB_MAX_BOLUS_U)
+        .coerceIn(0.0, MAX_SMB_MAX_BOLUS_U)
+
+    fun setUamSmbMaxBolusU(v: Double) = setDoubleString(KEY_UAM_SMB_MAX_BOLUS_U, v)
 
     // ===== Feature toggles =====
     fun enablePk() = safeGetBoolean(K_ENABLE_PK)
@@ -352,6 +386,10 @@ object SippPrefs {
         put("manualSleepEndMin", manualSleepEndMin())
         put("autoSleepEnabled", autoSleepEnabled())
 
+        // SIPP SMB caps (U)
+        put("smbMaxBolusU", smbMaxBolusU())
+        put("uamSmbMaxBolusU", uamSmbMaxBolusU())
+
         // live state
         loadState()?.let {
             put("state_diaH", it.diaH.toDouble())
@@ -407,6 +445,10 @@ object SippPrefs {
         setManualSleepStartMin(obj.optInt("manualSleepStartMin", manualSleepStartMin()))
         setManualSleepEndMin(obj.optInt("manualSleepEndMin", manualSleepEndMin()))
         setAutoSleepEnabled(obj.optBoolean("autoSleepEnabled", autoSleepEnabled()))
+
+        // SIPP SMB caps (U)
+        setSmbMaxBolusU(obj.optDouble("smbMaxBolusU", smbMaxBolusU()))
+        setUamSmbMaxBolusU(obj.optDouble("uamSmbMaxBolusU", uamSmbMaxBolusU()))
 
         // live state
         val dia = obj.optDouble("state_diaH", Double.NaN)

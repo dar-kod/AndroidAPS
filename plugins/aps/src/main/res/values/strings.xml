@@ -81,6 +81,10 @@
     <string name="smb_max_minutes_summary">Max minutes of basal to limit SMB to</string>
     <string name="uam_smb_max_minutes">UAM SMB max minutes</string>
     <string name="uam_smb_max_minutes_summary">Max minutes of basal to limit SMB to for UAM</string>
+    <string name="sipp_smb_max_bolus_u_title">Max SMB bolus (U)</string>
+    <string name="sipp_smb_max_bolus_u_message">Hard cap for each SMB/micro-bolus in insulin units (U). Applies to SMB and peak rescue SMB. Range: 0–25 U.</string>
+    <string name="sipp_uam_smb_max_bolus_u_title">Max SMB bolus for UAM (U)</string>
+    <string name="sipp_uam_smb_max_bolus_u_message">Hard cap for each UAM SMB/micro-bolus in insulin units (U). Applies to UAM SMB and peak rescue SMB when in UAM context. Range: 0–25 U.</string>
     <string name="carbs_req_threshold">Minimum Carbs Required For Suggestion</string>
     <string name="carbs_req_threshold_summary">Minimum grams of carbs to display a carbs suggestion alert. Carbs suggestions below this number will not trigger a notification.</string>
     <string name="lgs_threshold_summary">BG value below which insulin is suspended. Default value uses standard target model. User can set value between 60mg/dl (3.3mmol/l) and 100mg/dl(5.5mmol/l). Values below 65/3.6 result in use of default model</string>
