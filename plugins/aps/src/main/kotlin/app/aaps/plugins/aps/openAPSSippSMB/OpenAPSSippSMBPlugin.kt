@@ -2,10 +2,13 @@ package app.aaps.plugins.aps.openAPSSippSMB
 
 import android.content.Context
 import android.content.Intent
+import android.text.InputType
 import android.util.LongSparseArray
 import androidx.core.net.toUri
 import androidx.core.util.forEach
 import androidx.core.util.size
+import androidx.preference.EditTextPreference
+import androidx.preference.Preference
 import androidx.preference.PreferenceCategory
 import androidx.preference.PreferenceFragmentCompat
 import androidx.preference.PreferenceManager
@@ -74,6 +77,7 @@ import app.aaps.plugins.aps.OpenAPSFragment
 import app.aaps.plugins.aps.R
 import app.aaps.plugins.aps.events.EventOpenAPSUpdateGui
 import app.aaps.plugins.aps.events.EventResetOpenAPSGui
+import app.aaps.plugins.aps.openAPS.TddStatus
 import app.aaps.plugins.insulin.sipp.SentinelPkPdController
 import app.aaps.plugins.insulin.sipp.SippPrefs
 import io.reactivex.rxjava3.disposables.CompositeDisposable
@@ -84,6 +88,7 @@ import javax.inject.Provider
 import javax.inject.Singleton
 import kotlin.math.abs
 import kotlin.math.floor
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -139,7 +144,6 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
     }
 
     private val sippEnableGuard = LocalBooleanKey("sipp_enable_guard", true)
-
     private data class SippGuardSignals(
         val sippGuardHighMinutes: Int,  // horizon for high-BG scanning (minutes)
         val sippGuardLowMinutes: Int,   // horizon for low-BG scanning (minutes)
@@ -371,9 +375,9 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
                 if (on && SippPrefs.enableIsf()) SippPrefs.setEnableIsf(false)
                 true
             }
-
-        preferenceFragment.findPreference<AdaptiveIntPreference>(IntKey.ApsUamMaxMinutesOfBasalToLimitSmb.key)?.isVisible =
-            smbEnabled && uamEnabled
+        // SIPP SMB caps (absolute units)
+        preferenceFragment.findPreference<EditTextPreference>(SippPrefs.KEY_SMB_MAX_BOLUS_U)?.isVisible = smbEnabled
+        preferenceFragment.findPreference<EditTextPreference>(SippPrefs.KEY_UAM_SMB_MAX_BOLUS_U)?.isVisible = smbEnabled && uamEnabled
     }
 
     @Synchronized
@@ -399,6 +403,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
     }
 
     internal class DynIsfResult {
+
         var tdd1D: Double? = null
         var tdd7D: Double? = null
         var tddLast24H: Double? = null
@@ -407,53 +412,123 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         var tdd: Double? = null
         var variableSensitivity: Double? = null
         var insulinDivisor: Int = 0
+
         var tddLast24HCarbs = 0.0
         var tdd7DDataCarbs = 0.0
         var tdd7DAllDaysHaveCarbs = false
-        fun tddPartsCalculated() =
-            tdd1D != null && tdd7D != null && tddLast24H != null && tddLast4H != null && tddLast8to4H != null
+
+        fun tddPartsCalculated() = tdd1D != null && tdd7D != null && tddLast24H != null && tddLast4H != null && tddLast8to4H != null
+
+        fun log() =
+            "DynIsfResult: tdd1D=$tdd1D tdd7D=$tdd7D tddLast24H=$tddLast24H tddLast4H=$tddLast4H tddLast8to4H=$tddLast8to4H tdd=$tdd variableSensitivity=$variableSensitivity insulinDivisor=$insulinDivisor tdd7DDataCarbs=$tdd7DDataCarbs tdd7DAllDaysHaveCarbs=$tdd7DAllDaysHaveCarbs"
     }
 
+    @Volatile
+    internal var lastSippInstantIsfResult: SippInstantIsfResult? = null
+        private set
+
+    internal data class SippInstantIsfResult(
+        val isfMgdlPerU: Double,
+        val effectiveTddUPerDay: Double,
+        val insulin4hU: Double,
+        val insulin12hU: Double,
+        val insulin24hU: Double,
+        val tdd4eq: Double,
+        val tdd12eq: Double,
+        val tdd24: Double,
+        val fallbackReason: String?
+    )
+
+    internal fun calculateSippInstantIsf(
+        epsMultiplier: Double,
+        profileSensMgdlPerU: Double
+    ): SippInstantIsfResult {
+        val insulin4hU = tddCalculator.calculateDaily(-4L, 0L)?.totalAmount
+        val insulin12hU = tddCalculator.calculateDaily(-12L, 0L)?.totalAmount
+        val insulin24hU = tddCalculator.calculateDaily(-24L, 0L)?.totalAmount
+
+        fun fallback(reason: String): SippInstantIsfResult {
+            val res = SippInstantIsfResult(
+                isfMgdlPerU = profileSensMgdlPerU,
+                effectiveTddUPerDay = 0.0,
+                insulin4hU = insulin4hU ?: 0.0,
+                insulin12hU = insulin12hU ?: 0.0,
+                insulin24hU = insulin24hU ?: 0.0,
+                tdd4eq = 0.0,
+                tdd12eq = 0.0,
+                tdd24 = 0.0,
+                fallbackReason = reason
+            )
+            lastSippInstantIsfResult = res
+            return res
+        }
+
+        if (insulin4hU == null || insulin12hU == null || insulin24hU == null) {
+            return fallback("missing insulin history")
+        }
+
+        val tdd4eq = insulin4hU * 6.0
+        val tdd12eq = insulin12hU * 2.0
+        val instantTdd = (0.5 * tdd4eq) + (0.3 * tdd12eq) + (0.2 * insulin24hU)
+        val effectiveTdd = instantTdd * epsMultiplier
+
+        if (!effectiveTdd.isFinite() || effectiveTdd <= 0.0) {
+            return fallback("invalid effective TDD ($effectiveTdd)")
+        }
+
+        val isf = Round.roundTo(1800.0 / effectiveTdd, 0.1)
+        val res = SippInstantIsfResult(
+            isfMgdlPerU = isf,
+            effectiveTddUPerDay = effectiveTdd,
+            insulin4hU = insulin4hU,
+            insulin12hU = insulin12hU,
+            insulin24hU = insulin24hU,
+            tdd4eq = tdd4eq,
+            tdd12eq = tdd12eq,
+            tdd24 = insulin24hU,
+            fallbackReason = null
+        )
+        lastSippInstantIsfResult = res
+        return res
+    }
+
+
+
     private fun calculateRawDynIsf(multiplier: Double): DynIsfResult {
-        val dyn = DynIsfResult()
-
-        dyn.tdd1D = tddCalculator.averageTDD(tddCalculator.calculate(1, allowMissingDays = false))?.data?.totalAmount
+        val dynIsfResult = DynIsfResult()
+        // DynamicISF specific
+        // without these values DynISF doesn't work properly
+        // Current implementation is fallback to SMB if TDD history is not available. Thus calculated here
+        val glucoseStatus = glucoseStatusProvider.glucoseStatusData as GlucoseStatusSMB?
+        dynIsfResult.tdd1D = tddCalculator.averageTDD(tddCalculator.calculate(1, allowMissingDays = false))?.data?.totalAmount
         tddCalculator.averageTDD(tddCalculator.calculate(7, allowMissingDays = false))?.let {
-            dyn.tdd7D = it.data.totalAmount
-            dyn.tdd7DDataCarbs = it.data.carbs
-            dyn.tdd7DAllDaysHaveCarbs = it.allDaysHaveCarbs
+            dynIsfResult.tdd7D = it.data.totalAmount
+            dynIsfResult.tdd7DDataCarbs = it.data.carbs
+            dynIsfResult.tdd7DAllDaysHaveCarbs = it.allDaysHaveCarbs
+        }
+        tddCalculator.calculateDaily(-24, 0)?.also {
+            dynIsfResult.tddLast24H = it.totalAmount
+            dynIsfResult.tddLast24HCarbs = it.carbs
+        }
+        dynIsfResult.tddLast4H = tddCalculator.calculateDaily(-4, 0)?.totalAmount
+        dynIsfResult.tddLast8to4H = tddCalculator.calculateDaily(-8, -4)?.totalAmount
+
+        val insulin = activePlugin.activeInsulin
+        dynIsfResult.insulinDivisor = when {
+            insulin.peak > 65 -> 55 // rapid peak: 75
+            insulin.peak > 50 -> 65 // ultra rapid peak: 55
+            else              -> 75 // lyumjev peak: 45
         }
 
-        tddCalculator.calculateDaily(-24L, 0L)?.also {
-            dyn.tddLast24H = it.totalAmount
-            dyn.tddLast24HCarbs = it.carbs
+
+        if (dynIsfResult.tddPartsCalculated() && glucoseStatus != null) {
+            val tddStatus = TddStatus(dynIsfResult.tdd1D!!, dynIsfResult.tdd7D!!, dynIsfResult.tddLast24H!!, dynIsfResult.tddLast4H!!, dynIsfResult.tddLast8to4H!!)
+            val tddWeightedFromLast8H = ((1.4 * tddStatus.tddLast4H) + (0.6 * tddStatus.tddLast8to4H)) * 3
+            dynIsfResult.tdd = ((tddWeightedFromLast8H * 0.33) + (tddStatus.tdd7D * 0.34) + (tddStatus.tdd1D * 0.33)) * preferences.get(IntKey.ApsDynIsfAdjustmentFactor) / 100.0 * multiplier
+            dynIsfResult.variableSensitivity = Round.roundTo(1800 / (dynIsfResult.tdd!! * (ln((glucoseStatus.glucose / dynIsfResult.insulinDivisor) + 1))), 0.1)
+            aapsLogger.debug(LTag.APS, "multiplier=$multiplier dynIsfResult=${dynIsfResult.log()} glucoseStatus=${glucoseStatus.glucose} insulinDivisor=${dynIsfResult.insulinDivisor}")
         }
-
-        fun safeAmt(fromHour: Long, toHour: Long): Double =
-            tddCalculator.calculateDaily(fromHour, toHour)?.totalAmount ?: 0.0
-
-        val amt0to4 = safeAmt(-4L, 0L)
-        val amt4to12 = safeAmt(-12L, -4L)
-        val amt12to24 = safeAmt(-24L, -12L)
-
-        val uPerH0to4 = amt0to4 / 4.0
-        val uPerH4to12 = amt4to12 / 8.0
-        val uPerH12to24 = amt12to24 / 12.0
-
-        val w0to4 = 0.60
-        val w4to12 = 0.30
-        val w12to24 = 0.10
-
-        val weightedUph = (w0to4 * uPerH0to4) + (w4to12 * uPerH4to12) + (w12to24 * uPerH12to24)
-        val instantTdd = (weightedUph * 24.0).coerceAtLeast(0.0)
-
-        val effectiveTdd = (instantTdd * multiplier).let { if (it <= 0.0) 0.1 else it }
-
-        dyn.tdd = effectiveTdd
-        dyn.variableSensitivity = Round.roundTo(1800.0 / effectiveTdd, 0.1)
-        dyn.tddLast4H = amt0to4
-        dyn.tddLast8to4H = amt4to12
-        return dyn
+        return dynIsfResult
     }
 
     private data class ArwSignals(
@@ -603,6 +678,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
 
         var autosensResult = AutosensResult()
         val dynIsfResult = calculateRawDynIsf(epsMultiplier)
+        val dynIsfModeEffective = (!SippPrefs.enableIsf()) && dynIsfMode && dynIsfResult.tddPartsCalculated()
 
         if (dynIsfMode && !dynIsfResult.tddPartsCalculated()) {
             uiInteraction.addNotificationValidTo(
@@ -719,23 +795,37 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         }
 
         val baseIsfMgdl: Double = profileAny.getIsfMgdl("OpenAPSSMBPlugin")
-        val dsPair = calculateVariableIsf(now, epsMultiplier)
-        val dsIsf: Double? = dsPair.second
-        val sippIsf: Double? = if (SippPrefs.enableIsf()) dynIsfResult.variableSensitivity else null
 
+        val sippInstantIsfResult = calculateSippInstantIsf(
+            epsMultiplier = epsMultiplier,
+            profileSensMgdlPerU = baseIsfMgdl
+        )
+        val sippInstantIsfMgdlPerU = sippInstantIsfResult.isfMgdlPerU
+
+        // JS profile.sens must mirror OpenAPSSMB behavior:
+        // - when DynISF is ON, DetermineBasal uses profile.variable_sens (not sens)
+        // - when SIPP Instant ISF is ON, sens becomes the Instant ISF (DynISF is forced OFF)
         val sensForJs: Double = when {
-            SippPrefs.enableIsf() && sippIsf != null && sippIsf > 0.0                            -> sippIsf
-            preferences.get(BooleanKey.ApsUseDynamicSensitivity) && dsIsf != null && dsIsf > 0.0 -> dsIsf
-            else                                                                                 -> baseIsfMgdl
+            SippPrefs.enableIsf() && sippInstantIsfMgdlPerU > 0.0 -> sippInstantIsfMgdlPerU
+            else                                                  -> baseIsfMgdl
         }
 
-        runCatching { SippPrefs.saveLastInstantIsfMgdl(sensForJs, now, glucoseStatus.glucose, profileAny.getTargetLowMgdl()) }
-        runCatching { if (dsIsf != null && dsIsf > 0.0) SippPrefs.saveLastRawInstantIsfMgdl(dsIsf, now) }
+        val dynIsfNow: Double? =
+            if (dynIsfModeEffective) dynIsfResult.variableSensitivity else null
+
+        val isfUsedByAps: Double = when {
+            SippPrefs.enableIsf() && sippInstantIsfMgdlPerU > 0.0 -> sippInstantIsfMgdlPerU
+            dynIsfNow != null && dynIsfNow > 0.0                  -> dynIsfNow
+            else                                                  -> baseIsfMgdl
+        }
+
+        runCatching { SippPrefs.saveLastInstantIsfMgdl(isfUsedByAps, now, glucoseStatus.glucose, profileAny.getTargetLowMgdl()) }
+        runCatching { if (dynIsfNow != null && dynIsfNow > 0.0) SippPrefs.saveLastRawInstantIsfMgdl(dynIsfNow, now) }
 
         if ((SippPrefs.enableBasal() || SippPrefs.enableMaxBasal())) {
             synthesizeIfMissing(
                 profile = profileAny,
-                usedIsfMgdl = sensForJs,
+                usedIsfMgdl = isfUsedByAps,
                 deliveredBasalNow = tb?.convertedToAbsolute(now, profileAny) ?: activePlugin.activePump.baseBasalRate,
                 minutesRunning = tb?.getPassedDurationToTimeInMinutes(now) ?: 0,
                 minBg = minBg,
@@ -818,9 +908,9 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             temptargetSet = isTempTarget,
             autosens_max = preferences.get(DoubleKey.AutosensMax),
             out_units = if (profileFunction.getUnits() == GlucoseUnit.MMOL) "mmol/L" else "mg/dl",
-            variable_sens = if (dynIsfMode && dynIsfResult.tddPartsCalculated()) (dsIsf ?: 0.0) else 0.0,
+            variable_sens = if (dynIsfModeEffective) dynIsfResult.variableSensitivity ?: 0.0 else 0.0,
             insulinDivisor = 0,
-            TDD = calculateVariableIsf(now, epsMultiplier).second?.let { 1800.0 / it } ?: (dynIsfResult.tdd ?: 0.0)
+            TDD = dynIsfResult.tdd ?: 0.0
         )
 
         // ---- SIPP status banner (in Constraints section) ----
@@ -893,7 +983,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             val snap = sentinelController.activitySnapshot()
             (!snap.hrActive && !snap.cadenceActive && snap.sustainedActiveMin >= 20)
         }.getOrDefault(false) else false
-        
+
         val isSleepState = isManualSleep || isAutoSleep
 
         determineBasalSMB.determine_basal(
@@ -907,8 +997,12 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             sippPeakMinutes = peakMin,
             currentTime = now,
             flatBGsDetected = flatBGsDetected,
-            dynIsfMode = dynIsfMode && dynIsfResult.tddPartsCalculated(),
-            isSleepState = isSleepState
+            dynIsfMode = dynIsfModeEffective,
+            sippInstantIsfMode = SippPrefs.enableIsf(),
+            sippInstantIsfMgdlPerU = sippInstantIsfMgdlPerU,
+            sippMaxSmbBolusU = SippPrefs.smbMaxBolusU(),
+            sippMaxUamSmbBolusU = SippPrefs.uamSmbMaxBolusU(),
+            isSleepState = isSleepState,
         ).also {
             val determineBasalResult = apsResultProvider.get().with(it)
             determineBasalResult.inputConstraints = inputConstraints
@@ -931,7 +1025,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
                 )
 
                 val sippLowBG = guardSignals.sippLowBG
-                
+
                 // 72 mg/dL is a safe braking threshold.
                 val safeLowThreshold = 72.0 // 4.0 mmol/L
 
@@ -1066,7 +1160,6 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             .put(BooleanKey.ApsUseDynamicSensitivity, preferences)
             .put(IntKey.ApsDynIsfAdjustmentFactor, preferences)
             .put(sippEnableGuard, preferences)
-
     override fun applyConfiguration(configuration: JSONObject) {
         configuration
             .store(BooleanKey.ApsUseDynamicSensitivity, preferences)
@@ -1235,21 +1328,48 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
                 )
             )
 
+            // SIPP SMB caps are absolute units (U), not "minutes of basal".
             addPreference(
-                AdaptiveIntPreference(
-                    ctx = context,
-                    intKey = IntKey.ApsMaxMinutesOfBasalToLimitSmb,
-                    title = R.string.smb_max_minutes_summary
-                )
+                EditTextPreference(context).apply {
+                    key = SippPrefs.KEY_SMB_MAX_BOLUS_U
+                    title = rh.gs(R.string.sipp_smb_max_bolus_u_title)
+                    dialogTitle = title
+                    dialogMessage = rh.gs(R.string.sipp_smb_max_bolus_u_message)
+                    setOnBindEditTextListener { editText ->
+                        editText.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                    }
+                    // Default is set in SippPrefsInitProvider; this is just the UI range guard.
+                    onPreferenceChangeListener = Preference.OnPreferenceChangeListener { _, newValue ->
+                        val raw = newValue?.toString()?.trim().orEmpty()
+                        val parsed = raw.replace(',', '.').toDoubleOrNull()
+                        parsed != null && parsed.isFinite() && parsed >= 0.0 && parsed <= 25.0
+                    }
+                    summaryProvider = Preference.SummaryProvider<EditTextPreference> {
+                        val v = SippPrefs.smbMaxBolusU()
+                        String.format(Locale.US, "%.2f U", v)
+                    }
+                }
             )
 
             addPreference(
-                AdaptiveIntPreference(
-                    ctx = context,
-                    intKey = IntKey.ApsUamMaxMinutesOfBasalToLimitSmb,
-                    dialogMessage = R.string.uam_smb_max_minutes,
-                    title = R.string.uam_smb_max_minutes_summary
-                )
+                EditTextPreference(context).apply {
+                    key = SippPrefs.KEY_UAM_SMB_MAX_BOLUS_U
+                    title = rh.gs(R.string.sipp_uam_smb_max_bolus_u_title)
+                    dialogTitle = title
+                    dialogMessage = rh.gs(R.string.sipp_uam_smb_max_bolus_u_message)
+                    setOnBindEditTextListener { editText ->
+                        editText.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+                    }
+                    onPreferenceChangeListener = Preference.OnPreferenceChangeListener { _, newValue ->
+                        val raw = newValue?.toString()?.trim().orEmpty()
+                        val parsed = raw.replace(',', '.').toDoubleOrNull()
+                        parsed != null && parsed.isFinite() && parsed >= 0.0 && parsed <= 25.0
+                    }
+                    summaryProvider = Preference.SummaryProvider<EditTextPreference> {
+                        val v = SippPrefs.uamSmbMaxBolusU()
+                        String.format(Locale.US, "%.2f U", v)
+                    }
+                }
             )
 
             addPreference(
@@ -1324,9 +1444,8 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
                         setDefaultValue(true)
                     }
                     addPreference(guardToggle)
-
                     // SIPP Guard horizons display (read-only)
-                    val guardHorizonPref = androidx.preference.Preference(context).apply {
+                    val guardHorizonPref = Preference(context).apply {
                         title = rh.gs(R.string.sipp_guard_horizon_label, lastSippGuardHighMinutes, lastSippGuardLowMinutes)
                         isSelectable = false
                     }

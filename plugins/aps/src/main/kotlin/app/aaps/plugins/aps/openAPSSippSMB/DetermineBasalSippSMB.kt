@@ -16,12 +16,11 @@ import java.time.Instant
 import java.time.ZoneId
 import javax.inject.Inject
 import javax.inject.Singleton
-import kotlin.math.ln
 import kotlin.math.abs
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
-import kotlin.math.round
 import kotlin.math.roundToInt
 
 @Singleton
@@ -64,13 +63,21 @@ class DetermineBasalSippSMB @Inject constructor(
     //if (profile.out_units === "mmol/L") round(value / 18, 1).toFixed(1);
     //else Math.round(value);
 
-    fun enable_smb(profile: OapsProfile, microBolusAllowed: Boolean, meal_data: MealData, target_bg: Double): Boolean {
+    fun enable_smb(
+        profile: OapsProfile,
+        microBolusAllowed: Boolean,
+        meal_data: MealData,
+        targetBgLow: Double,
+        targetBgHigh: Double
+    ): Boolean {
+        // AAPS supports a target range: target_low (down) and target_high (up).
+        // SMB enable/disable decisions should respect the bound being tested.
         // disable SMB when a high temptarget is set
         if (!microBolusAllowed) {
             consoleError.add("SMB disabled (!microBolusAllowed)")
             return false
-        } else if (!profile.allowSMB_with_high_temptarget && profile.temptargetSet && target_bg > 100) {
-            consoleError.add("SMB disabled due to high temptarget of $target_bg")
+        } else if (!profile.allowSMB_with_high_temptarget && profile.temptargetSet && targetBgHigh > 100) {
+            consoleError.add("SMB disabled due to high temptarget of ${convert_bg(targetBgLow)}–${convert_bg(targetBgHigh)}")
             return false
         }
 
@@ -94,8 +101,8 @@ class DetermineBasalSippSMB @Inject constructor(
         }
 
         // enable SMB/UAM (if enabled in preferences) if a low temptarget is set
-        if (profile.enableSMB_with_temptarget && (profile.temptargetSet && target_bg < 100)) {
-            consoleError.add("SMB enabled for temptarget of ${convert_bg(target_bg)}")
+        if (profile.enableSMB_with_temptarget && profile.temptargetSet && targetBgLow < 100) {
+            consoleError.add("SMB enabled for temptarget of ${convert_bg(targetBgLow)}–${convert_bg(targetBgHigh)}")
             return true
         }
 
@@ -150,9 +157,30 @@ class DetermineBasalSippSMB @Inject constructor(
         }
     }
 
+    /**
+     * Data class to hold peak scan results for requirement-aware SMB.
+     */
+    private data class PeakScanResult(
+        val activeTraceType: String,         // "UAM", "COB", or "IOB"
+        val peakPredBg: Double,              // highest BG in fast window
+        val peakTimeMin: Int,                // time at peak (minutes from now)
+        val minPredBgLow: Double,            // lowest BG in low horizon
+        val requiredAdditionalInsulinU: Double, // insulin needed to bring peak to target
+        val lowBrakeTriggered: Boolean       // whether low brake blocked SMB
+    )
+
     fun determine_basal(
         glucose_status: GlucoseStatus, currenttemp: CurrentTemp, iob_data_array: Array<IobTotal>, profile: OapsProfile, autosens_data: AutosensResult, meal_data: MealData,
-        microBolusAllowed: Boolean, currentTime: Long, flatBGsDetected: Boolean, dynIsfMode: Boolean, isSleepState: Boolean, sippPeakMinutes: Int
+        microBolusAllowed: Boolean,
+        currentTime: Long,
+        flatBGsDetected: Boolean,
+        dynIsfMode: Boolean,
+        sippInstantIsfMode: Boolean = false,
+        sippInstantIsfMgdlPerU: Double = 0.0,
+        sippMaxSmbBolusU: Double = 0.5,
+        sippMaxUamSmbBolusU: Double = 0.3,
+        isSleepState: Boolean,
+        sippPeakMinutes: Int
     ): RT {
         consoleError.clear()
         consoleLog.clear()
@@ -214,10 +242,17 @@ class DetermineBasalSippSMB @Inject constructor(
         // TODO eliminate
         val max_iob = profile.max_iob // maximum amount of non-bolus IOB OpenAPS will ever deliver
 
-        // if min and max are set, then set target to their average
-        var target_bg = (profile.min_bg + profile.max_bg) / 2
+        // AAPS has a target range: target_low (down) and target_high (up).
+        // Use the MID target for insulin-need math, but keep bounds for range logic.
         var min_bg = profile.min_bg
         var max_bg = profile.max_bg
+        var target_bg = (min_bg + max_bg) / 2
+
+        // Keep target_bg always derived from the current bounds.
+        fun recomputeTargetBg(): Double {
+            target_bg = (min_bg + max_bg) / 2
+            return target_bg
+        }
 
         var sensitivityRatio: Double
         val high_temptarget_raises_sensitivity = profile.exercise_mode || profile.high_temptarget_raises_sensitivity
@@ -262,15 +297,12 @@ class DetermineBasalSippSMB @Inject constructor(
                 // with a target of 100, default 0.7-1.2 autosens min/max range would allow a 93-117 target range
                 min_bg = round((min_bg - 60) / autosens_data.ratio, 0) + 60
                 max_bg = round((max_bg - 60) / autosens_data.ratio, 0) + 60
-                var new_target_bg = round((target_bg - 60) / autosens_data.ratio, 0) + 60
-                // don't allow target_bg below 80
-                new_target_bg = max(80.0, new_target_bg)
-                if (target_bg == new_target_bg)
-                    consoleLog.add("target_bg unchanged: $new_target_bg; ")
+                val oldTarget = target_bg
+                recomputeTargetBg()
+                if (oldTarget == target_bg)
+                    consoleLog.add("target_bg unchanged: $target_bg; ")
                 else
-                    consoleLog.add("target_bg from $target_bg to $new_target_bg; ")
-
-                target_bg = new_target_bg
+                    consoleLog.add("target_bg from $oldTarget to $target_bg (avg of min/max); ")
             }
         }
 
@@ -288,9 +320,15 @@ class DetermineBasalSippSMB @Inject constructor(
         val minAvgDelta = min(glucose_status.shortAvgDelta, glucose_status.longAvgDelta)
         val maxDelta = max(glucose_status.delta, max(glucose_status.shortAvgDelta, glucose_status.longAvgDelta))
 
-        val sens =
-            if (dynIsfMode) profile.variable_sens
-            else {
+        val sens = when {
+            sippInstantIsfMode && sippInstantIsfMgdlPerU > 0.0 -> {
+                consoleLog.add("ISF set by SIPP Instant: ${round(sippInstantIsfMgdlPerU, 1)}")
+                sippInstantIsfMgdlPerU
+            }
+
+            dynIsfMode                                         -> profile.variable_sens
+
+            else                                               -> {
                 val profile_sens = round(profile.sens, 1)
                 val adjusted_sens = round(profile.sens / sensitivityRatio, 1)
                 if (adjusted_sens != profile_sens) {
@@ -301,6 +339,7 @@ class DetermineBasalSippSMB @Inject constructor(
                 adjusted_sens
                 //console.log(" (autosens ratio "+sensitivityRatio+")");
             }
+        }
         consoleError.add("CR:${profile.carb_ratio}")
 
         //calculate BG impact: the amount BG "should" be rising or falling based on insulin activity alone
@@ -322,63 +361,63 @@ class DetermineBasalSippSMB @Inject constructor(
             bg >= 72 && bg <= 108 &&
             Math.abs(glucose_status.delta) < 3
 
-        // SIPP SAFETY: Resistance Mode Guard
-        // Definition: BG > 12 mmol/L (216 mg/dL), flat/rising trend, and significant active insulin.
-        // IOB threshold: >= 2.0 U OR >= 50% of theoretical correction need.
-        val theoreticalCorrectionForResistance = max(0.0, (bg - target_bg) / sens)
-        val isResistance = bg > 216 &&
-            glucose_status.longAvgDelta > -1.0 &&
-            (iob_data.iob >= 2.0 || iob_data.iob >= theoreticalCorrectionForResistance * 0.5)
-
-        if (isResistance) {
-            rT.reason.append("SIPP: Suspected resistance. Bounds relaxed. Check site. ")
-            consoleError.add("SIPP: Suspected resistance (BG > 216, Flat, IOB active). Bounds relaxed.")
+        // calculate the naive (bolus calculator math) eventual BG based on net IOB and sensitivity
+        //
+        // SIPP SAFETY: avoid the "negative IOB vacuum" when BG is below target.
+        // Negative net IOB can inflate naive_eventualBG (bg - iob*sens) and provoke dosing while still below target.
+        // We clamp negative IOB to 0 for dosing calculations whenever BG < target_bg (and always in the sleep band guard).
+        val clampNegativeIobForDosing = (bg < target_bg)
+        val effectiveIOB = when {
+            iob_data.iob < 0 && (isSleepBand || clampNegativeIobForDosing) -> 0.0
+            else                                                           -> iob_data.iob
         }
 
-        // calculate the naive (bolus calculator math) eventual BG based on net IOB and sensitivity
         val naive_eventualBG =
-            if (dynIsfMode)
-                round(bg - (iob_data.iob * sens), 0)
-            else {
-                // SIPP SAFETY: "The Vacuum Effect" Fix
-                // If in Sleep Band and IOB is negative, clamp effective IOB to 0 for dosing calculations.
-                // This prevents "missing insulin" logic from triggering aggressive dosing in safe sleep range.
-                val effectiveIOB = if (isSleepBand && iob_data.iob < 0) 0.0 else iob_data.iob
-                
-                if (effectiveIOB > 0) round(bg - (effectiveIOB * sens), 0)
-                else  // if IOB is negative, be more conservative and use the lower of sens, profile.sens
-                    round(bg - (effectiveIOB * min(sens, profile.sens)), 0)
+            if (dynIsfMode) {
+                round(bg - (effectiveIOB * sens), 0)
+            } else {
+                if (effectiveIOB > 0) {
+                    round(bg - (effectiveIOB * sens), 0)
+                } else {
+                    // If IOB is negative and we didn't clamp it (e.g., BG above target), be conservative:
+                    // use the lower of sens and profile.sens, unless Instant ISF is active (then keep sens consistent).
+                    val negIobSens = if (sippInstantIsfMode) sens else min(sens, profile.sens)
+                    round(bg - (effectiveIOB * negIobSens), 0)
+                }
             }
+
         // and adjust it for the deviation above
         var eventualBG = naive_eventualBG + deviation
 
         // raise target for noisy / raw CGM data
         if (bg > max_bg && profile.adv_target_adjustments && !profile.temptargetSet) {
-            // with target=100, as BG rises from 100 to 160, adjustedTarget drops from 100 to 80
+            // Advanced target adjustments act on the *bounds*; keep target_bg as the average of min/max.
+            // with target=100, as BG rises from 100 to 160, adjusted bounds drop toward 80
             val adjustedMinBG = round(max(80.0, min_bg - (bg - min_bg) / 3.0), 0)
-            val adjustedTargetBG = round(max(80.0, target_bg - (bg - target_bg) / 3.0), 0)
             val adjustedMaxBG = round(max(80.0, max_bg - (bg - max_bg) / 3.0), 0)
-            // if eventualBG, naive_eventualBG, and target_bg aren't all above adjustedMinBG, don’t use it
-            //console.error("naive_eventualBG:",naive_eventualBG+", eventualBG:",eventualBG);
+
+            // if eventualBG, naive_eventualBG, and min_bg aren't all above adjustedMinBG, don’t use it
             if (eventualBG > adjustedMinBG && naive_eventualBG > adjustedMinBG && min_bg > adjustedMinBG) {
                 consoleLog.add("Adjusting targets for high BG: min_bg from $min_bg to $adjustedMinBG; ")
                 min_bg = adjustedMinBG
             } else {
                 consoleLog.add("min_bg unchanged: $min_bg; ")
             }
-            // if eventualBG, naive_eventualBG, and target_bg aren't all above adjustedTargetBG, don’t use it
-            if (eventualBG > adjustedTargetBG && naive_eventualBG > adjustedTargetBG && target_bg > adjustedTargetBG) {
-                consoleLog.add("target_bg from $target_bg to $adjustedTargetBG; ")
-                target_bg = adjustedTargetBG
-            } else {
-                consoleLog.add("target_bg unchanged: $target_bg; ")
-            }
+
             // if eventualBG, naive_eventualBG, and max_bg aren't all above adjustedMaxBG, don’t use it
             if (eventualBG > adjustedMaxBG && naive_eventualBG > adjustedMaxBG && max_bg > adjustedMaxBG) {
                 consoleError.add("max_bg from $max_bg to $adjustedMaxBG")
                 max_bg = adjustedMaxBG
             } else {
                 consoleError.add("max_bg unchanged: $max_bg")
+            }
+
+            val oldTarget = target_bg
+            recomputeTargetBg()
+            if (oldTarget == target_bg) {
+                consoleLog.add("target_bg unchanged: $target_bg; ")
+            } else {
+                consoleLog.add("target_bg from $oldTarget to $target_bg (avg of min/max); ")
             }
         }
 
@@ -425,7 +464,14 @@ class DetermineBasalSippSMB @Inject constructor(
         ZTpredBGs.add(bg)
         UAMpredBGs.add(bg)
 
-        var enableSMB = enable_smb(profile, microBolusAllowed, meal_data, target_bg)
+        var enableSMB = enable_smb(profile, microBolusAllowed, meal_data, min_bg, max_bg)
+
+        // SIPP SAFETY: If current BG is below target, do not microbolus.
+        // (Basal adjustments are still allowed.)
+        if (enableSMB && bg < target_bg) {
+            consoleError.add("SIPP Safety: BG ${convert_bg(bg)} < target ${convert_bg(target_bg)} - disabling SMB")
+            enableSMB = false
+        }
 
         // enable UAM (if enabled in preferences)
         val enableUAM = profile.enableUAM
@@ -720,7 +766,97 @@ class DetermineBasalSippSMB @Inject constructor(
             }
         }
 
-        val fractionCarbsLeft = meal_data.mealCOB / meal_data.carbs
+        // =====================================================================
+        // SIPP Phase 1: Requirement-aware SMB with peak scan + absolute cap
+        // =====================================================================
+        // Compute guard horizons from peak time
+        val sippGuardHighMinutes = (sippPeakMinutes + 30).coerceIn(120, 240)
+        val sippGuardLowMinutes = (2 * sippPeakMinutes).coerceIn(120, 240)
+
+        // Fast window for peak scan: peak+30, clamped to 90..sippGuardHighMinutes
+        val fastWindowMinutes = (sippPeakMinutes + 30).coerceIn(90, sippGuardHighMinutes)
+
+        // A) Select active prediction trace: UAM > COB > IOB
+        // Use the same logic the algorithm uses to decide between prediction sources
+        val hasUAM = enableUAM && minUAMPredBG < 999
+        val hasCOB = (meal_data.mealCOB > 0 && (ci > 0 || remainingCIpeak > 0)) && minCOBPredBG < 999
+
+        val (activePredictions, activeTraceType) = when {
+            hasUAM -> UAMpredBGs to "UAM"
+            hasCOB -> COBpredBGs to "COB"
+            else   -> IOBpredBGs to "IOB"
+        }
+
+        // Guard against empty predictions (should not happen, but be safe)
+        val peakScanResult: PeakScanResult? = if (activePredictions.isEmpty()) {
+            consoleError.add("SIPP Peak: no predictions available, skipping peak scan")
+            null
+        } else {
+            // B) Peak scan: find max BG in fast window (index-safe)
+            val endIdxHigh = min(activePredictions.lastIndex, fastWindowMinutes / 5)
+            var peakPredBg = activePredictions[0]
+            var peakIdx = 0
+            for (i in 0..endIdxHigh) {
+                if (activePredictions[i] > peakPredBg) {
+                    peakPredBg = activePredictions[i]
+                    peakIdx = i
+                }
+            }
+            val peakTimeMin = peakIdx * 5
+
+            // C) Low scan: find min BG in low horizon (for existing low brake)
+            val endIdxLow = min(activePredictions.lastIndex, sippGuardLowMinutes / 5)
+            var minPredBgLow = activePredictions[0]
+            for (i in 0..endIdxLow) {
+                if (activePredictions[i] < minPredBgLow) {
+                    minPredBgLow = activePredictions[i]
+                }
+            }
+
+            // D) Compute requiredAdditionalInsulinU
+            // SIPP-first ISF for demand conversion:
+            // 1) SIPP instant ISF (if enabled and valid), else
+            // 2) dynISF future_sens (if enabled and valid), else
+            // 3) profile sensitivity (sens).
+            val demandIsf = when {
+                sippInstantIsfMode && sippInstantIsfMgdlPerU > 0 -> sippInstantIsfMgdlPerU
+                dynIsfMode && future_sens > 0                    -> future_sens
+                else                                             -> sens
+            }
+
+            // Demand is defined from the ACTIVE predicted peak above target_bg (not min_bg).
+            val demandTargetBg = target_bg
+            val requiredAdditionalInsulinU = if (demandIsf > 0) {
+                max(0.0, (peakPredBg - demandTargetBg) / demandIsf)
+            } else 0.0
+
+            // E) Determine if low brake should trigger (existing behavior check)
+            // Low brake triggers if minPredBgLow < threshold
+            val lowBrakeTriggered = minPredBgLow < threshold
+
+            // H) Concise log line for peak scan (round only for display)
+            consoleError.add(
+                "SIPP Peak: $activeTraceType peak=${convert_bg(peakPredBg)}@${peakTimeMin}m, " +
+                    "reqU=${round(requiredAdditionalInsulinU, 2)}, " +
+                    "minLow=${convert_bg(minPredBgLow)}, lowBrake=$lowBrakeTriggered"
+            )
+
+            // Store peak scan result (full precision, no rounding)
+            PeakScanResult(
+                activeTraceType = activeTraceType,
+                peakPredBg = peakPredBg,
+                peakTimeMin = peakTimeMin,
+                minPredBgLow = minPredBgLow,
+                requiredAdditionalInsulinU = requiredAdditionalInsulinU,
+                lowBrakeTriggered = lowBrakeTriggered
+            )
+        }
+
+        val fractionCarbsLeft: Double = when {
+            meal_data.carbs > 0.0   -> (meal_data.mealCOB / meal_data.carbs).coerceIn(0.0, 1.0)
+            meal_data.mealCOB > 0.0 -> 1.0
+            else                    -> 0.0
+        }
         // if we have COB and UAM is enabled, average both
         if (minUAMPredBG < 999 && minCOBPredBG < 999) {
             // weight COBpredBG vs. UAMpredBG based on how many carbs remain as COB
@@ -1077,7 +1213,6 @@ class DetermineBasalSippSMB @Inject constructor(
             val internalFactorIOB = 0.4
             val internalFractionOfBaseline = 0.5
 
-            var peakRescueInsulinReq = 0.0
 
             // Check triggers
             if (bg > target_bg && bg > internalHighStart &&
@@ -1087,24 +1222,24 @@ class DetermineBasalSippSMB @Inject constructor(
                 // Trigger 1.3: Predicted peak above target within horizon
                 val peakHorizonMinutes = max(minHorizon, min(maxHorizon, sippPeakMinutes))
                 var peakBG = 0.0
-                
+
                 // Scan predictions up to horizon
                 // Note: predBGs are 5-minute intervals. index * 5 = minutes.
                 val maxIndex = peakHorizonMinutes / 5
-                
+
                 // Helper to scan a curve
-                fun scanCurve(curve: List<Double>?) {
-                    curve?.let {
-                        for (i in 0 until min(it.size, maxIndex)) {
-                            if (it[i] > peakBG) peakBG = it[i]
-                        }
+                fun scanCurve(curve: List<Double>) {
+                    if (curve.isEmpty()) return
+                    val end = min(curve.lastIndex, maxIndex)
+                    for (i in 0..end) {
+                        if (curve[i] > peakBG) peakBG = curve[i]
                     }
                 }
-                
+
                 scanCurve(IOBpredBGs)
                 scanCurve(COBpredBGs)
                 scanCurve(UAMpredBGs)
-                // ZTpredBGs usually track IOB/COB but good to include if they exist and are higher? 
+                // ZTpredBGs usually track IOB/COB but good to include if they exist and are higher?
                 // Usually IOB/COB/UAM cover it. SIPP SMB uses these.
 
                 // Check peak severity
@@ -1115,61 +1250,61 @@ class DetermineBasalSippSMB @Inject constructor(
                     // Actually, minPredBG is the minimum of the curves. If minPredBG < threshold, we should skip.
                     // We already have minPredBG calculated earlier.
                     // Let's check minPredBG against a safety floor.
-                    
-                    // Also check if any curve dips low within the horizon specifically? 
+
+                    // Also check if any curve dips low within the horizon specifically?
                     // minPredBG is the global minimum of the curves.
                     if (minPredBG > threshold) {
-                         // 2. Extra correction calculation
-                         val rawCorrectionUnits = max(0.0, (peakBG - target_bg) / sens)
-                         val iobCompensation = internalFactorIOB * iob_data.iob
-                         // Ensure we don't subtract negative IOB (which would add insulin) - though IOB should be positive here if we are high?
-                         // If IOB is negative, iobCompensation is negative. 
-                         // effectivelyCorrection = raw - clamp(neg, 0, raw) = raw - 0 = raw. 
-                         // Wait, if IOB is negative, we might want to add MORE? 
-                         // The prompt says "Estimate how much of that correction is likely covered by existing IOB and subtract a portion".
-                         // If IOB is negative, it's not covering anything. So subtraction should be 0.
-                         // clamp(iobCompensation, 0.0, rawCorrectionUnits) handles this correctly (0 if neg).
-                         
-                         val effectiveCorrection = max(0.0, rawCorrectionUnits - max(0.0, min(iobCompensation, rawCorrectionUnits)))
-                         
-                         peakRescueInsulinReq = effectiveCorrection
-                         
-                         // 3. Safety Caps
-                         // Cap relative to baseline insulinReq (absolute value)
-                         // baselineInsulinReq is 'insulinReq' at this point.
-                         val baselineCap = internalFractionOfBaseline * abs(insulinReq)
-                         
-                         // If baseline is 0 (e.g. minPredBG > target but < eventualBG?), we might still want to rescue?
-                         // "Let baselineInsulinReq be the insulinReq that SIPP SMB currently computes without this feature."
-                         // If SIPP computes 0, then 0.5 * 0 = 0. So we wouldn't rescue if SIPP doesn't think we need ANY insulin?
-                         // That seems to imply this feature only *boosts* existing SMBs.
-                         // "Combine them: insulinReqTotal = baselineInsulinReq + peakRescueInsulinReq"
-                         // If baseline is 0, we can't boost.
-                         // But if SIPP sees rising BG, it usually calculates *some* insulinReq if eventualBG > target.
-                         // If insulinReq is 0 here, it means min(minPredBG, eventualBG) <= target_bg.
-                         // If minPredBG <= target, we shouldn't be adding rescue insulin anyway (Trigger 1.4 check implies we are safe, but maybe not high enough to trigger normal SMB).
-                         // But Trigger 1.3 requires peakBG > target.
-                         // If minPredBG is low but peak is high, we have a "dip then rise" or "rise then dip".
-                         // If minPredBG > threshold, we are safe from lows.
-                         // If insulinReq is small, we want to make it bigger.
-                         // If insulinReq is 0, can we add?
-                         // The prompt says: "Keep it bounded relative to baseline SIPP SMB... peakRescueUnits <= INTERNAL_FRACTION_OF_BASELINE * |baselineInsulinReq|"
-                         // This strictly implies if baseline is 0, rescue is 0.
-                         // This makes it a "Booster" only.
-                         
-                         if (peakRescueInsulinReq > baselineCap) {
-                             peakRescueInsulinReq = baselineCap
-                         }
-                         
-                         // If very small, skip
-                         if (peakRescueInsulinReq < 0.05) { // epsilon
-                             peakRescueInsulinReq = 0.0
-                         }
-                         
-                         if (peakRescueInsulinReq > 0) {
-                             rT.reason.append(" PeakRescue +${round(peakRescueInsulinReq, 2)}U (Peak ${convert_bg(peakBG)}). ")
-                             insulinReq += peakRescueInsulinReq
-                         }
+                        // 2. Extra correction calculation
+                        val rawCorrectionUnits = max(0.0, (peakBG - target_bg) / sens)
+                        val iobCompensation = internalFactorIOB * iob_data.iob
+                        // Ensure we don't subtract negative IOB (which would add insulin) - though IOB should be positive here if we are high?
+                        // If IOB is negative, iobCompensation is negative.
+                        // effectivelyCorrection = raw - clamp(neg, 0, raw) = raw - 0 = raw.
+                        // Wait, if IOB is negative, we might want to add MORE?
+                        // The prompt says "Estimate how much of that correction is likely covered by existing IOB and subtract a portion".
+                        // If IOB is negative, it's not covering anything. So subtraction should be 0.
+                        // clamp(iobCompensation, 0.0, rawCorrectionUnits) handles this correctly (0 if neg).
+
+                        val effectiveCorrection = max(0.0, rawCorrectionUnits - max(0.0, min(iobCompensation, rawCorrectionUnits)))
+
+                        var peakRescueInsulinReq = effectiveCorrection
+
+                        // 3. Safety Caps
+                        // Cap relative to baseline insulinReq (absolute value)
+                        // baselineInsulinReq is 'insulinReq' at this point.
+                        val baselineCap = internalFractionOfBaseline * abs(insulinReq)
+
+                        // If baseline is 0 (e.g. minPredBG > target but < eventualBG?), we might still want to rescue?
+                        // "Let baselineInsulinReq be the insulinReq that SIPP SMB currently computes without this feature."
+                        // If SIPP computes 0, then 0.5 * 0 = 0. So we wouldn't rescue if SIPP doesn't think we need ANY insulin?
+                        // That seems to imply this feature only *boosts* existing SMBs.
+                        // "Combine them: insulinReqTotal = baselineInsulinReq + peakRescueInsulinReq"
+                        // If baseline is 0, we can't boost.
+                        // But if SIPP sees rising BG, it usually calculates *some* insulinReq if eventualBG > target.
+                        // If insulinReq is 0 here, it means min(minPredBG, eventualBG) <= target_bg.
+                        // If minPredBG <= target, we shouldn't be adding rescue insulin anyway (Trigger 1.4 check implies we are safe, but maybe not high enough to trigger normal SMB).
+                        // But Trigger 1.3 requires peakBG > target.
+                        // If minPredBG is low but peak is high, we have a "dip then rise" or "rise then dip".
+                        // If minPredBG > threshold, we are safe from lows.
+                        // If insulinReq is small, we want to make it bigger.
+                        // If insulinReq is 0, can we add?
+                        // The prompt says: "Keep it bounded relative to baseline SIPP SMB... peakRescueUnits <= INTERNAL_FRACTION_OF_BASELINE * |baselineInsulinReq|"
+                        // This strictly implies if baseline is 0, rescue is 0.
+                        // This makes it a "Booster" only.
+
+                        if (peakRescueInsulinReq > baselineCap) {
+                            peakRescueInsulinReq = baselineCap
+                        }
+
+                        // If very small, skip
+                        if (peakRescueInsulinReq < 0.05) { // epsilon
+                            peakRescueInsulinReq = 0.0
+                        }
+
+                        if (peakRescueInsulinReq > 0) {
+                            rT.reason.append(" PeakRescue +${round(peakRescueInsulinReq, 2)}U (Peak ${convert_bg(peakBG)}). ")
+                            insulinReq += peakRescueInsulinReq
+                        }
                     }
                 }
             }
@@ -1178,11 +1313,11 @@ class DetermineBasalSippSMB @Inject constructor(
             // SIPP SAFETY: "The Panic Stack" Fix (Correction Bounds)
             // Bound total correction insulin (IOB + new SMB) to a multiple of theoretical need.
             val theoreticalCorrection = max(0.0, (bg - target_bg) / sens)
-            val correctionBoundFactor = if (isResistance) 1.5 else 1.2
+            val correctionBoundFactor = 1.2
             val correctionLimit = theoreticalCorrection * correctionBoundFactor
 
             // Check if we are already over the limit
-            if (iob_data.iob > correctionLimit) {
+            if (theoreticalCorrection > 0 && iob_data.iob > correctionLimit) {
                 rT.reason.append("SIPP Safety: IOB ${round(iob_data.iob, 2)} > Limit ${round(correctionLimit, 2)} (${correctionBoundFactor}x). SMB=0, Neutral Basal. ")
                 consoleError.add("SIPP Safety: IOB > Correction Limit. SMB disabled, Basal reset to profile.")
                 // Force neutral basal (profile.current_basal) and zero SMB
@@ -1192,7 +1327,7 @@ class DetermineBasalSippSMB @Inject constructor(
 
             // rate required to deliver insulinReq more insulin over 30m:
             var rate = basal + (2 * insulinReq)
-            
+
             // SIPP SAFETY: Sleep Band Basal Cap
             if (isSleepBand) {
                 val sleepBasalCap = profile.current_basal * 1.1
@@ -1218,7 +1353,7 @@ class DetermineBasalSippSMB @Inject constructor(
             // SIPP SAFETY: Enforce Correction Bound on new SMB
             // If adding insulinReq (approx SMB size) would push us over, clamp it.
             // Note: Actual SMB size is calculated below as microBolus, but we clamp insulinReq here to influence it.
-            if (iob_data.iob + insulinReq > correctionLimit) {
+            if (theoreticalCorrection > 0 && iob_data.iob + insulinReq > correctionLimit) {
                 val maxAllowed = max(0.0, correctionLimit - iob_data.iob)
                 if (insulinReq > maxAllowed) {
                     rT.reason.append("SIPP Safety: Clamping req ${round(insulinReq, 2)} -> ${round(maxAllowed, 2)} to fit limit. ")
@@ -1231,23 +1366,40 @@ class DetermineBasalSippSMB @Inject constructor(
             //console.error(iob_data.lastBolusTime);
             //console.error(profile.temptargetSet, target_bg, rT.COB);
             // only allow microboluses with COB or low temp targets, or within DIA hours of a bolus
-            val maxBolus: Double
-            if (microBolusAllowed && enableSMB && bg > threshold) {
-                // never bolus more than maxSMBBasalMinutes worth of basal
+            if (microBolusAllowed && enableSMB && bg > threshold && bg >= target_bg) {
+                // SIPP SMB caps are absolute insulin units (U), not "basal minutes".
                 val mealInsulinReq = round(meal_data.mealCOB / profile.carb_ratio, 3)
-                if (iob_data.iob > mealInsulinReq && iob_data.iob > 0) {
-                    consoleError.add("IOB ${iob_data.iob} > COB ${meal_data.mealCOB}; mealInsulinReq = $mealInsulinReq")
-                    consoleError.add("profile.maxUAMSMBBasalMinutes: ${profile.maxUAMSMBBasalMinutes} profile.current_basal: ${profile.current_basal}")
-                    maxBolus = round(profile.current_basal * profile.maxUAMSMBBasalMinutes / 60, 1)
-                } else {
-                    consoleError.add("profile.maxSMBBasalMinutes: ${profile.maxSMBBasalMinutes} profile.current_basal: ${profile.current_basal}")
-                    maxBolus = round(profile.current_basal * profile.maxSMBBasalMinutes / 60, 1)
-                }
-                // bolus 1/2 the insulinReq, up to maxBolus, rounding down to nearest bolus increment
+                val iobU = if (iob_data.iob.isFinite()) iob_data.iob else 0.0
+                val correctionIOBU = max(0.0, iobU - max(0.0, mealInsulinReq))
+
+                // Demand (U) from ACTIVE prediction trace peak using SIPP-first ISF (peakScanResult),
+                // falling back to insulinReq if peak demand is unavailable/invalid.
+                val demandU = peakScanResult?.requiredAdditionalInsulinU
+                    ?.takeIf { it.isFinite() && it > 0.0 }
+                    ?: max(0.0, insulinReq)
+
+                // Remaining demand after subtracting correction-relevant IOB (IOB above meal coverage).
+                val remainingDemandU = max(0.0, demandU - correctionIOBU)
+
+                // Choose which user cap applies (normal SMB vs UAM SMB).
+                val isUamContext = (peakScanResult?.activeTraceType == "UAM") || (iobU > mealInsulinReq && iobU > 0)
+                val prefCapU = if (isUamContext) sippMaxUamSmbBolusU else sippMaxSmbBolusU
+                val maxBolus = prefCapU.coerceIn(0.0, 25.0)
+
+                // bolus fraction of insulinReq, up to cap and remaining demand, rounding down to nearest bolus increment
                 val roundSMBTo = 1 / profile.bolus_increment
-                val microBolus = Math.floor(Math.min(insulinReq / 2, maxBolus) * roundSMBTo) / roundSMBTo
+                val allowedU = max(0.0, min(insulinReq, min(maxBolus, remainingDemandU)))
+                var microBolus = Math.floor(allowedU * roundSMBTo) / roundSMBTo
+
+                consoleError.add(
+                    "SIPP SMB cap: ctx=${if (isUamContext) "UAM" else "SMB"} capU=${round(maxBolus, 2)}U, " +
+                        "demandU=${round(demandU, 2)}U, correctionIOB=${round(correctionIOBU, 2)}U, remainingDemandU=${round(remainingDemandU, 2)}U, " +
+                        "insulinReq=${round(insulinReq, 2)}U => microBolus=${round(microBolus, 2)}U"
+                )
+
                 // calculate a long enough zero temp to eventually correct back up to target
-                val smbTarget = target_bg
+                // For SMB "limit" style calculations, use target_low (min_bg) as requested
+                val smbTarget = min_bg
                 val worstCaseInsulinReq = (smbTarget - (naive_eventualBG + minIOBPredBG) / 2.0) / sens
                 var durationReq = round(60 * worstCaseInsulinReq / profile.current_basal)
 
@@ -1286,6 +1438,10 @@ class DetermineBasalSippSMB @Inject constructor(
                 consoleError.add("naive_eventualBG $naive_eventualBG,${durationReq}m ${smbLowTempReq}U/h temp needed; last bolus ${round(lastBolusAge / 60.0, 1)}m ago; maxBolus: $maxBolus")
                 if (lastBolusAge > SMBInterval - 6.0) {   // 6s tolerance
                     if (microBolus > 0) {
+                        // Final defensive clamp: absolute invariant before assignment
+                        microBolus = min(microBolus, maxBolus)
+                        val remainingDemandRoundedDown = Math.floor(remainingDemandU * roundSMBTo) / roundSMBTo
+                        microBolus = min(microBolus, remainingDemandRoundedDown)
                         rT.units = microBolus
                         rT.reason.append("Microbolusing ${microBolus}U. ")
                     }
