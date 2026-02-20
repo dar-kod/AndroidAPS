@@ -87,6 +87,7 @@ import javax.inject.Inject
 import javax.inject.Provider
 import javax.inject.Singleton
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.floor
 import kotlin.math.ln
 import kotlin.math.max
@@ -730,6 +731,17 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             ((now - lastBolusMs) / 60000L).toInt()
         }.getOrElse { 9_999 }
 
+        // ===== Sleep state (used for DetermineBasal + no-meal ISF learning) =====
+        val isManualSleep = SippPrefs.manualSleepEnabled() && isNowInWindow(SippPrefs.manualSleepStartMin(), SippPrefs.manualSleepEndMin())
+        val isAutoSleep = if (SippPrefs.sleepAutoEnabled()) runCatching {
+            val snap = sentinelController.activitySnapshot()
+            // Auto-sleep triggers on sustained inactivity (not on activity).
+            snap.fusionEnabled && (snap.hrEnabled || snap.cadenceEnabled) &&
+                !snap.hintActive && !snap.hrActive && !snap.cadenceActive && snap.sustainedActiveMin <= 1
+        }.getOrDefault(false) else false
+        val isSleepState = isManualSleep || isAutoSleep
+
+
         val diaMin = (profileAny.dia * 60.0).toInt()
         val lookbackTarget = (bolusLookbackPerDiaFrac * diaMin).toInt()
         val bolusLookbackMinReq = lookbackTarget.coerceIn(bolusLookbackMin, bolusLookbackMax)
@@ -800,7 +812,27 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             epsMultiplier = epsMultiplier,
             profileSensMgdlPerU = baseIsfMgdl
         )
-        val sippInstantIsfMgdlPerU = sippInstantIsfResult.isfMgdlPerU
+        val sippRawInstantIsfMgdlPerU = sippInstantIsfResult.isfMgdlPerU
+
+        // F5 (part 1): apply a slow no-meal ISF multiplier only in no-meal / sleep windows.
+        // This does NOT rely on carb entry (works for users who don't enter carbs).
+        val noMealEvidence = (minutesSinceLastBolus >= 180) &&
+            (mealData.carbs <= 0.0) &&
+            (mealData.mealCOB <= 0.0) &&
+            (mealData.slopeFromMaxDeviation <= 0.0) &&
+            (abs(glucoseStatus.delta) <= 10.0)
+
+        val noMealWindow = isSleepState || noMealEvidence
+        val persistedNoMealMult = SippPrefs.noMealIsfMult()
+
+        val sippInstantIsfMgdlPerU = if (SippPrefs.enableIsf() && sippRawInstantIsfMgdlPerU > 0.0 && noMealWindow) {
+            // Bound only by the hard ISF limits (principled safety, not an arbitrary clamp).
+            val bounded = (sippRawInstantIsfMgdlPerU * persistedNoMealMult)
+                .coerceIn(HardLimits.MIN_ISF, HardLimits.MAX_ISF)
+            bounded
+        } else {
+            sippRawInstantIsfMgdlPerU
+        }
 
         // JS profile.sens must mirror OpenAPSSMB behavior:
         // - when DynISF is ON, DetermineBasal uses profile.variable_sens (not sens)
@@ -978,13 +1010,7 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
 
         // SIPP Sleep State Detection
         // Used for "Sleep Band" safety guard in DetermineBasalSippSMB
-        val isManualSleep = SippPrefs.manualSleepEnabled() && isNowInWindow(SippPrefs.manualSleepStartMin(), SippPrefs.manualSleepEndMin())
-        val isAutoSleep = if (SippPrefs.sleepAutoEnabled()) runCatching {
-            val snap = sentinelController.activitySnapshot()
-            (!snap.hrActive && !snap.cadenceActive && snap.sustainedActiveMin >= 20)
-        }.getOrDefault(false) else false
-
-        val isSleepState = isManualSleep || isAutoSleep
+        // isSleepState computed above (F5 no-meal ISF + DetermineBasal)
 
         determineBasalSMB.determine_basal(
             glucose_status = glucoseStatus,
@@ -1012,6 +1038,60 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             determineBasalResult.currentTemp = currentTemp
             determineBasalResult.oapsProfile = oapsProfile
             determineBasalResult.mealData = mealData
+
+            // ========================= F5 (part 2): Learn from BG line in no-meal windows =========================
+            // We learn a slow multiplier (stored in SippPrefs) that nudges Instant ISF only when meal-likelihood is low.
+            // Signal = (BG line at ~tPeak/3) - (IOB model line at same time). Positive => unmodeled upward pressure => need MORE insulin => LOWER ISF.
+            // Update is done in log-space (multiplicative) with a long time constant; it decays toward 1.0 outside no-meal windows.
+            runCatching {
+                val prevMult = SippPrefs.noMealIsfMult()
+                val prevTs = SippPrefs.noMealIsfTsMs() ?: now
+                val dtMin = ((now - prevTs).toDouble() / 60000.0).coerceIn(0.0, 60.0)
+                val hasTime = dtMin >= 1.0
+
+                val iobPred = it.predBGs?.IOB?.map { v -> v.toDouble() } ?: emptyList()
+                if (iobPred.isNotEmpty()) {
+                    val idx = min(iobPred.lastIndex, max(1, (peakMin / 3.0 / 5.0).toInt()))
+                    val modelBg = iobPred[idx]
+                    val bgLine = glucoseStatus.glucose + (glucoseStatus.shortAvgDelta * idx)
+                    val residual = bgLine - modelBg  // mg/dL
+
+                    // Scale: tie to the active target band width (not arbitrary).
+                    val k = max(18.0, (maxBg - targetBg) * 4.0)
+
+                    // Desired multiplier: exp(-residual/k)
+                    val targetMult = exp(-residual / k)
+
+                    // Long time constant: 6h => alpha ~ dt/tau
+                    val tauMin = 360.0
+                    val alpha = if (hasTime) (dtMin / tauMin).coerceIn(0.0, 0.05) else 0.0
+
+                    // Bound multiplier only insofar as it cannot push ISF beyond hard limits for current raw ISF.
+                    val multMin = if (sippRawInstantIsfMgdlPerU > 0.0) (HardLimits.MIN_ISF / sippRawInstantIsfMgdlPerU) else 0.01
+                    val multMax = if (sippRawInstantIsfMgdlPerU > 0.0) (HardLimits.MAX_ISF / sippRawInstantIsfMgdlPerU) else 100.0
+
+                    val nextMult = if (noMealWindow && hasTime) {
+                        val logPrev = ln(max(1e-6, prevMult))
+                        val logTgt = ln(max(1e-6, targetMult))
+                        exp((1.0 - alpha) * logPrev + alpha * logTgt).coerceIn(multMin, multMax)
+                    } else if (!noMealWindow && hasTime) {
+                        // Decay toward 1.0 outside no-meal windows (2h time constant)
+                        val tauDecayMin = 120.0
+                        val a2 = (dtMin / tauDecayMin).coerceIn(0.0, 0.1)
+                        val logPrev = ln(max(1e-6, prevMult))
+                        exp((1.0 - a2) * logPrev).coerceAtMost(multMax).coerceAtLeast(multMin)
+                    } else prevMult
+
+                    if (nextMult.isFinite() && nextMult > 0.0 && abs(nextMult - prevMult) > 1e-4) {
+                        SippPrefs.saveNoMealIsfMult(nextMult, now)
+                        aapsLogger.debug(
+                            LTag.APS,
+                            "SIPP F5 noMealIsfMult: prev=${"%.4f".format(prevMult)} -> next=${"%.4f".format(nextMult)} " +
+                                "(noMeal=$noMealWindow dtMin=${"%.1f".format(dtMin)} residual=${"%.1f".format(residual)} idx=$idx)"
+                        )
+                    }
+                }
+            }.onFailure { /* never let learning crash dosing */ }
 
             // SIPP GUARD (Brake Only - uses AAPS predictions only)
             val enableGuard = preferences.get(sippEnableGuard)

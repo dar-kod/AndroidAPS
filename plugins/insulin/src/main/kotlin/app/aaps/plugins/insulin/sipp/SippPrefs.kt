@@ -113,6 +113,8 @@ object SippPrefs {
     private const val K_STATE_DIA_H = "SIPP_state_dia_h"
     private const val K_STATE_TPEAK_MIN = "SIPP_state_tpeak_min"
     private const val K_STATE_ISF_MULT = "SIPP_state_isf_mult"
+    private const val K_STATE_NOMEAL_ISF_MULT = "SIPP_state_nomeal_isf_mult"
+    private const val K_STATE_NOMEAL_ISF_TS_MS = "SIPP_state_nomeal_isf_ts_ms"
     private const val K_STATE_TS_MS = "SIPP_state_timestamp_ms"
 
     // ISF readouts (USED by loop) + context
@@ -294,6 +296,19 @@ object SippPrefs {
         }
     }
 
+    // ===== No-meal ISF adaptive multiplier (F5 state; no new user-facing knobs) =====
+    fun noMealIsfMult(): Double = safeGetFloatOrNull(K_STATE_NOMEAL_ISF_MULT)?.toDouble() ?: 1.0
+    fun noMealIsfTsMs(): Long? = safeGetLongOrNull(K_STATE_NOMEAL_ISF_TS_MS)
+
+    fun saveNoMealIsfMult(mult: Double, tsMs: Long) {
+        if (!mult.isFinite() || mult <= 0.0) return
+        p().edit {
+            putFloat(K_STATE_NOMEAL_ISF_MULT, mult.toFloat())
+            putLong(K_STATE_NOMEAL_ISF_TS_MS, tsMs)
+        }
+    }
+
+
     // ===== ISF persistence (USED) + context =====
     fun saveLastInstantIsfMgdl(isfMgdl: Double, tsMs: Long, bgMgdl: Double? = null, targetLowMgdl: Double? = null) {
         p().edit {
@@ -398,6 +413,10 @@ object SippPrefs {
             put("state_savedAtMs", it.savedAtMs)
         }
 
+        // no-meal ISF mult state
+        put("state_noMealIsfMult", noMealIsfMult())
+        noMealIsfTsMs()?.let { ts -> put("state_noMealIsfTsMs", ts) }
+
         // ISF (used/raw) + context
         lastInstantIsfMgdl()?.let { put("last_isf_used_mgdl", it) }
         lastInstantIsfTsMs()?.let { put("last_isf_used_ts", it) }
@@ -457,6 +476,13 @@ object SippPrefs {
         val ts = obj.optLong("state_savedAtMs", 0L)
         if (!dia.isNaN() && tp != Int.MIN_VALUE && !im.isNaN() && ts != 0L) {
             saveState(dia.toFloat(), tp, im.toFloat(), ts)
+        }
+
+        // no-meal ISF mult state
+        val nm = obj.optDouble("state_noMealIsfMult", Double.NaN)
+        val nmTs = obj.optLong("state_noMealIsfTsMs", 0L)
+        if (!nm.isNaN() && nmTs != 0L) {
+            saveNoMealIsfMult(nm, nmTs)
         }
 
         // ISF (used/raw) + context

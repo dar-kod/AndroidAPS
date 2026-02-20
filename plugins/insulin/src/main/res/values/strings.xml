@@ -32,7 +32,7 @@
     <string name="sipp_enable_pk_title">Enable SIPP PK</string>
     <string name="sipp_enable_pk_summary">Auto-tune DIA and peak time within safety rails.</string>
     <string name="sipp_enable_isf_title">Enable SIPP PD</string>
-    <string name="sipp_enable_isf_summary">Uses Instant ISF from a recent-weighted TDD blend (4h/12h/24h).</string>
+    <string name="sipp_enable_isf_summary">Uses Sentinel Instant ISF (EPS-scaled) from recent insulin history (4h/12h/24h), with no-meal learning.</string>
     <string name="sipp_allow_dia_above_9h_title">Allow DIA &gt; 9 h</string>
     <string name="sipp_allow_dia_above_9h_summary">Advanced: allows DIA up to 24 h for slow absorption and stacking.</string>
 

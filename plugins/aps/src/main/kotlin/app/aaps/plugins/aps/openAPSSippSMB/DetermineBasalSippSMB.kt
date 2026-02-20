@@ -197,6 +197,7 @@ class DetermineBasalSippSMB @Inject constructor(
 
         // TODO eliminate
         val profile_current_basal = round_basal(profile.current_basal)
+        val current_basal = profile_current_basal // alias for legacy naming used in safety checks
         var basal = profile_current_basal
 
         // TODO eliminate
@@ -326,9 +327,9 @@ class DetermineBasalSippSMB @Inject constructor(
                 sippInstantIsfMgdlPerU
             }
 
-            dynIsfMode                                         -> profile.variable_sens
+            dynIsfMode -> profile.variable_sens
 
-            else                                               -> {
+            else       -> {
                 val profile_sens = round(profile.sens, 1)
                 val adjusted_sens = round(profile.sens / sensitivityRatio, 1)
                 if (adjusted_sens != profile_sens) {
@@ -342,8 +343,31 @@ class DetermineBasalSippSMB @Inject constructor(
         }
         consoleError.add("CR:${profile.carb_ratio}")
 
+        // =====================================================================
+        // F1: Treat negative basal debt / negative insulin activity as non-physiological in sleep / no-meal contexts.
+        // Rationale: negative activity (from suspend/basal-debt artifacts) can inflate predictions and provoke insulin.
+        // This is an INVARIANT clamp used only for prediction math (not reporting), and must work even if sleep fails.
+        // Evidence (no new knobs):
+        //  - explicit meal entry (carbs/COB) and/or deviation slope => digestion evidence
+        //  - rising trend => allow negative activity to remain (can be physiological rebound)
+        //  - sleep OR stable/no-rise + no digestion evidence => clamp negative activity to 0
+        // =====================================================================
+        val sippMealEntered = (meal_data.carbs > 0.0) || (meal_data.mealCOB > 0.0)
+        val sippDigestionEvidence = sippMealEntered || (meal_data.slopeFromMaxDeviation > 0.0)
+
+        val sippTrendRising = (glucose_status.shortAvgDelta > 6.0) || (glucose_status.delta > 6.0)
+        val sippTrendStable = (abs(glucose_status.shortAvgDelta) <= 3.0) && (abs(glucose_status.delta) <= 3.0)
+
+        // No-meal likely even if user never enters carbs: stable BG + no digestion evidence.
+        val sippNoMealLikely = (!sippDigestionEvidence) && (!sippTrendRising) && sippTrendStable
+        val sippSleepNoMealLikely = isSleepState && (!sippDigestionEvidence) && (!sippTrendRising)
+
+        val sippClampNegActivity = sippSleepNoMealLikely || sippNoMealLikely
+
+
         //calculate BG impact: the amount BG "should" be rising or falling based on insulin activity alone
-        val bgi = round((-iob_data.activity * sens * 5), 2)
+        val activityForBgi = if (sippClampNegActivity && iob_data.activity < 0) 0.0 else iob_data.activity
+        val bgi = round((-activityForBgi * sens * 5), 2)
         // project deviations for 30 minutes
         var deviation = round(30 / 5 * (minDelta - bgi))
         // don't overreact to a big negative delta: use minAvgDelta if deviation is negative
@@ -366,10 +390,10 @@ class DetermineBasalSippSMB @Inject constructor(
         // SIPP SAFETY: avoid the "negative IOB vacuum" when BG is below target.
         // Negative net IOB can inflate naive_eventualBG (bg - iob*sens) and provoke dosing while still below target.
         // We clamp negative IOB to 0 for dosing calculations whenever BG < target_bg (and always in the sleep band guard).
-        val clampNegativeIobForDosing = (bg < target_bg)
+        val clampNegativeIobForDosing = (bg < target_bg) || sippClampNegActivity
         val effectiveIOB = when {
             iob_data.iob < 0 && (isSleepBand || clampNegativeIobForDosing) -> 0.0
-            else                                                           -> iob_data.iob
+            else -> iob_data.iob
         }
 
         val naive_eventualBG =
@@ -599,19 +623,21 @@ class DetermineBasalSippSMB @Inject constructor(
         var aCOBpredBG: Double?
         iobArray.forEach { iobTick ->
             //console.error(iobTick);
-            val predBGI: Double = round((-iobTick.activity * sens * 5), 2)
-            val IOBpredBGI: Double =
-                if (dynIsfMode) round((-iobTick.activity * (1800 / (profile.TDD * (ln((max(IOBpredBGs[IOBpredBGs.size - 1], 39.0) / profile.insulinDivisor) + 1)))) * 5), 2)
-                else predBGI
+            val tickActivity = if (sippClampNegActivity && iobTick.activity < 0) 0.0 else iobTick.activity
             iobTick.iobWithZeroTemp ?: error("iobTick.iobWithZeroTemp missing")
+            val tickZtActivity = if (sippClampNegActivity && iobTick.iobWithZeroTemp!!.activity < 0) 0.0 else iobTick.iobWithZeroTemp!!.activity
+            val predBGI: Double = round((-tickActivity * sens * 5), 2)
+            val IOBpredBGI: Double =
+                if (dynIsfMode) round((-tickActivity * (1800 / (profile.TDD * (ln((max(IOBpredBGs[IOBpredBGs.size - 1], 39.0) / profile.insulinDivisor) + 1)))) * 5), 2)
+                else predBGI
             // try to find where is crashing https://console.firebase.google.com/u/0/project/androidaps-c34f8/crashlytics/app/android:info.nightscout.androidaps/issues/950cdbaf63d545afe6d680281bb141e5?versions=3.3.0-dev-d%20(1500)&time=last-thirty-days&types=crash&sessionEventKey=673BF7DD032300013D4704707A053273_2017608123846397475
             if (iobTick.iobWithZeroTemp!!.activity.isNaN() || sens.isNaN())
                 fabricPrivacy.logCustom("iobTick.iobWithZeroTemp!!.activity=${iobTick.iobWithZeroTemp!!.activity} sens=$sens")
             val predZTBGI =
-                if (dynIsfMode) round((-iobTick.iobWithZeroTemp!!.activity * (1800 / (profile.TDD * (ln((max(ZTpredBGs[ZTpredBGs.size - 1], 39.0) / profile.insulinDivisor) + 1)))) * 5), 2)
-                else round((-iobTick.iobWithZeroTemp!!.activity * sens * 5), 2)
+                if (dynIsfMode) round((-tickZtActivity * (1800 / (profile.TDD * (ln((max(ZTpredBGs[ZTpredBGs.size - 1], 39.0) / profile.insulinDivisor) + 1)))) * 5), 2)
+                else round((-tickZtActivity * sens * 5), 2)
             val predUAMBGI =
-                if (dynIsfMode) round((-iobTick.activity * (1800 / (profile.TDD * (ln((max(UAMpredBGs[UAMpredBGs.size - 1], 39.0) / profile.insulinDivisor) + 1)))) * 5), 2)
+                if (dynIsfMode) round((-tickActivity * (1800 / (profile.TDD * (ln((max(UAMpredBGs[UAMpredBGs.size - 1], 39.0) / profile.insulinDivisor) + 1)))) * 5), 2)
                 else predBGI
             // for IOBpredBGs, predicted deviation impact drops linearly from current deviation down to zero
             // over 60 minutes (data points every 5m)
@@ -667,14 +693,14 @@ class DetermineBasalSippSMB @Inject constructor(
             // set minPredBGs starting when currently-dosed insulin activity will peak
             // look ahead 60m (regardless of insulin type) so as to be less aggressive on slower insulins
             // add 30m to allow for insulin delivery (SMBs or temps)
-            val insulinPeakTime = 90
+            val insulinPeakTime = 0 // SIPP SAFETY: always scan the full horizon for minima
             val insulinPeak5m = (insulinPeakTime / 60.0) * 12.0
             //console.error(insulinPeakTime, insulinPeak5m, profile.insulinPeakTime, profile.curve);
 
-            // wait 90m before setting minIOBPredBG
+            // SIPP SAFETY: no “wait until peak” delay for minPred scanning (insulinPeakTime delay disabled).
             if (IOBpredBGs.size > insulinPeak5m && (IOBpredBG < minIOBPredBG)) minIOBPredBG = round(IOBpredBG, 0)
             if (IOBpredBG > maxIOBPredBG) maxIOBPredBG = IOBpredBG
-            // wait 85-105m before setting COB and 60m for UAM minPredBGs
+            // SIPP SAFETY: COB minPred scanning uses the same no-delay horizon; UAM minPred remains 60m (UAM is noisier).
             if ((cid != 0.0 || remainingCIpeak > 0) && COBpredBGs.size > insulinPeak5m && (COBpredBG < minCOBPredBG)) minCOBPredBG = round(COBpredBG, 0)
             if ((cid != 0.0 || remainingCIpeak > 0) && COBpredBG > maxIOBPredBG) maxCOBPredBG = COBpredBG
             if (enableUAM && UAMpredBGs.size > 12 && (UAMpredBG < minUAMPredBG)) minUAMPredBG = round(UAMpredBG, 0)
@@ -776,17 +802,177 @@ class DetermineBasalSippSMB @Inject constructor(
         // Fast window for peak scan: peak+30, clamped to 90..sippGuardHighMinutes
         val fastWindowMinutes = (sippPeakMinutes + 30).coerceIn(90, sippGuardHighMinutes)
 
-        // A) Select active prediction trace: UAM > COB > IOB
+        // A) Select active prediction trace: UAM > COB > IOB (but suppress phantom UAM during sleep rebound)
         // Use the same logic the algorithm uses to decide between prediction sources
         val hasUAM = enableUAM && minUAMPredBG < 999
         val hasCOB = (meal_data.mealCOB > 0 && (ci > 0 || remainingCIpeak > 0)) && minCOBPredBG < 999
 
+        // ---- SIPP Sleep inference (no new user knobs) ----
+        // Goal:
+        // 1) During sleep with COB=0, do NOT treat UAM spikes from basal-debt / rebound as meal digestion (prevents large SMBs after hypos).
+        // 2) Still allow prolonged digestion at night (COB may be 0) when evidence is strong and sustained.
+        // Sleep state is passed in from OpenAPSSippSMBPlugin (Manual or Auto sleep).
+        // Auto-sleep is derived from Sentinel activity fusion; we intentionally do NOT add a time-of-day fallback here.
+        val sippIsSleep = isSleepState
+
+// How much "basal debt" (negative IOB) exists (in U and in hours of current basal).
+        val sippBasalDebtU = max(0.0, -iob_data.iob)
+        val sippBasalDebtHours = if (current_basal > 0) (sippBasalDebtU / current_basal) else 0.0
+
+        val lastBolusAgeMinutes =
+            if (iob_data.lastBolusTime > 0) ((systemTime - iob_data.lastBolusTime) / 60000.0) else Double.POSITIVE_INFINITY
+        val sippRecentBolusWithinPeak = lastBolusAgeMinutes <= sippPeakMinutes
+
+        // Sleep + COB==0 + no recent bolus near the model peak => default to "SleepNoMeal".
+        val sippSleepNoMeal = sippIsSleep && meal_data.mealCOB <= 0.0 && !sippRecentBolusWithinPeak
+
+        // Guard-based low-risk signal (uses prediction math already computed above; no delay).
+        // If the IOB/ZT guard predicts dipping below max(threshold,target), treat any UAM rise as rebound-risk.
+        val sippGuardLowRisk = min(minIOBGuardBG, minZTGuardBG) < max(threshold, target_bg)
+
+        // Model-derived "sustained window" for digestion inference:
+        // use ~half the PK/PD peak time, clamped to 60–120 min so it works across insulins.
+        val sippSustainedWindowMinutes = (sippPeakMinutes / 2.0).coerceIn(60.0, 120.0)
+        val sippSustainedIdx = min(UAMpredBGs.lastIndex, (sippSustainedWindowMinutes / 5.0).toInt())
+
+        // Credible-UAM score (majority vote of existing signals).
+        var sippUamCredibleScore = 0
+        if (glucose_status.shortAvgDelta > 0) sippUamCredibleScore++
+        if (glucose_status.delta > 0) sippUamCredibleScore++
+        if (deviation > 0) sippUamCredibleScore++
+        if (meal_data.slopeFromMaxDeviation > 0) sippUamCredibleScore++
+        if (glucose_status.shortAvgDelta > expectedDelta) sippUamCredibleScore++
+
+        // F3+F5 helper: BG-line vs IOB-model-line mismatch ("unmodeled upward pressure").
+        // Captures unannounced carbs, delayed digestion, dawn/stress hormones — but must NOT trigger during rebound/basal-debt artifacts.
+        val sippLineWindowMinutes = (sippPeakMinutes / 3.0).coerceIn(15.0, 60.0)
+        val sippLineIdx = min(IOBpredBGs.lastIndex, (sippLineWindowMinutes / 5.0).toInt())
+        val sippIobLine = if (IOBpredBGs.isNotEmpty() && sippLineIdx >= 0) IOBpredBGs[sippLineIdx] else bg
+        val sippBgLine = bg + (glucose_status.shortAvgDelta * sippLineIdx)
+        val sippLinePressureUp =
+            (glucose_status.shortAvgDelta > expectedDelta) &&
+                (deviation > 0) &&
+                (sippBgLine > max_bg) &&
+                (sippIobLine <= max_bg) &&
+                !sippGuardLowRisk &&
+                (sippBasalDebtHours < 1.0)
+
+        if (sippLinePressureUp) {
+            // Strong evidence of real upward glucose pressure; increases meal-likelihood (F3) safely under F2.
+            sippUamCredibleScore++
+            consoleError.add(
+                "SIPP linePressureUp: win=${round(sippLineWindowMinutes, 1)}m bgLine=${convert_bg(sippBgLine)} > max=${convert_bg(max_bg)} " +
+                    "while iobLine=${convert_bg(sippIobLine)} <= max; debtH=${round(sippBasalDebtHours, 2)} guardLowRisk=$sippGuardLowRisk => +1 UAM cred"
+            )
+        }
+
+        val sippUamCredible = sippUamCredibleScore >= 3
+
+        // "Sustained high" in early window means: even the MIN of UAM prediction stays above max target.
+        val sippUamMinInSustainedWindow =
+            if (hasUAM && UAMpredBGs.isNotEmpty() && sippSustainedIdx >= 0)
+                (0..sippSustainedIdx).minOf { UAMpredBGs[it] }
+            else
+                0.0
+
+        val sippUamSustainedHigh = hasUAM && (sippUamMinInSustainedWindow > max_bg)
+        // Phantom-UAM detection (no new knobs):
+        // If COB=0 + negative IOB (basal debt) + BG not high, but UAM predicts much higher than IOB trace,
+        // treat that UAM rise as rebound/artifact and block SMB.
+        val sippUamPred = UAMpredBG ?: 0.0
+        val sippIobPred = IOBpredBG
+        val sippUamDivergesFromIob =
+            hasUAM && (sippUamPred > 0.0) && (sippIobPred > 0.0) &&
+                ((sippUamPred - sippIobPred) > (max_bg - target_bg))
+        val sippPhantomUamLikely =
+            (meal_data.mealCOB <= 0.0) && (iob_data.iob < 0.0) && (bg <= max_bg) && sippUamDivergesFromIob
+
+        // Sleep rebound likelihood:
+        // - COB=0
+        // - in/near target band (<= max_bg)
+        // - large basal debt (~>= 1h of basal missed)
+        // - guard indicates low-risk
+        // This combination matches "post-hypo rebound / suspension artifact" nights.
+        val sippSleepReboundLikely =
+            sippIsSleep &&
+                meal_data.mealCOB <= 0.0 &&
+                (bg <= max_bg) &&
+                (sippBasalDebtHours >= 1.0) &&
+                sippGuardLowRisk &&
+                (glucose_status.shortAvgDelta > 0 || glucose_status.delta > 0)
+
+        // Allow prolonged digestion at night even with COB=0 only if:
+        // - BG is already above max_bg
+        // - guard does NOT predict a low (so we aren't in rebound risk)
+        // - UAM evidence is both credible and sustained-high
+        val sippSleepAllowUamDigestion =
+            sippIsSleep &&
+                meal_data.mealCOB <= 0.0 &&
+                (bg > max_bg) &&
+                !sippGuardLowRisk &&
+                sippUamCredible &&
+                sippUamSustainedHigh && !sippPhantomUamLikely
+
+        // UAM is allowed when:
+        // - daytime OR (sleep but not SleepNoMeal) OR (sleep digestion override),
+        // AND we are not in the rebound-likely state.
+        val sippUamAllowedForDigestion =
+            hasUAM &&
+                (!sippSleepNoMeal || sippSleepAllowUamDigestion) &&
+                !sippSleepReboundLikely && !sippPhantomUamLikely
+
+        // Sleep SMB should be blocked if we are in "SleepNoMeal" without digestion override, especially during rebound.
+        val sippSleepSmbBlocked =
+            sippIsSleep &&
+                meal_data.mealCOB <= 0.0 &&
+                !sippSleepAllowUamDigestion &&
+                (bg <= max_bg || sippSleepReboundLikely || sippPhantomUamLikely)
+
+        // Recovery SMB block even if Sleep mode isn't enabled.
+        val sippRecoverySmbBlocked =
+            (meal_data.mealCOB <= 0.0) &&
+                (bg <= max_bg) &&
+                !sippSleepAllowUamDigestion &&
+                (sippSleepReboundLikely || sippPhantomUamLikely)
+        // F3: SMB gating — only allow SMB when meal likelihood is real (works even when carbs are not entered).
+        // Meal-likelihood is true if:
+        //  - COB model active OR carb window active, OR
+        //  - UAM digestion is allowed AND credible, OR
+        //  - BG-line shows real upward pressure vs IOB-model (linePressureUp).
+        val sippCarbWindowActive = (meal_data.carbs != 0.0)
+        val sippMealLikelyForSmb =
+            hasCOB || sippCarbWindowActive ||
+                (sippUamAllowedForDigestion && sippUamCredible) ||
+                sippLinePressureUp
+
+        val sippMealGateSmbBlocked = !sippMealLikelyForSmb
+
+        // F4: Recovery hold after lows (model-derived, no new knob):
+        // In no-meal contexts, if guard predicts dipping below TARGET (stricter than threshold), block SMB.
+        val sippRecoveryHoldSmbBlocked =
+            sippMealGateSmbBlocked &&
+                (bg <= max_bg) &&
+                (min(minIOBGuardBG, minZTGuardBG) < target_bg)
+
+        if (enableSMB && (sippMealGateSmbBlocked || sippRecoveryHoldSmbBlocked)) {
+            enableSMB = false
+            rT.reason.append(
+                if (sippRecoveryHoldSmbBlocked)
+                    "SIPP F4: RecoveryHold blocks SMB (minPred<target, no-meal). "
+                else
+                    "SIPP F3: No-meal likelihood blocks SMB. "
+            )
+        }
+
+        val sippSmbBlocked =
+            sippSleepSmbBlocked || sippRecoverySmbBlocked || sippMealGateSmbBlocked || sippRecoveryHoldSmbBlocked
+
+
         val (activePredictions, activeTraceType) = when {
-            hasUAM -> UAMpredBGs to "UAM"
+            sippUamAllowedForDigestion -> UAMpredBGs to "UAM"
             hasCOB -> COBpredBGs to "COB"
             else   -> IOBpredBGs to "IOB"
         }
-
         // Guard against empty predictions (should not happen, but be safe)
         val peakScanResult: PeakScanResult? = if (activePredictions.isEmpty()) {
             consoleError.add("SIPP Peak: no predictions available, skipping peak scan")
@@ -820,14 +1006,16 @@ class DetermineBasalSippSMB @Inject constructor(
             // 3) profile sensitivity (sens).
             val demandIsf = when {
                 sippInstantIsfMode && sippInstantIsfMgdlPerU > 0 -> sippInstantIsfMgdlPerU
-                dynIsfMode && future_sens > 0                    -> future_sens
-                else                                             -> sens
+                dynIsfMode && future_sens > 0 -> future_sens
+                else                          -> sens
             }
 
             // Demand is defined from the ACTIVE predicted peak above target_bg (not min_bg).
             val demandTargetBg = target_bg
+            val digestionEvidence = hasCOB || sippUamAllowedForDigestion
+            val demandBg = if (digestionEvidence) peakPredBg else (activePredictions.lastOrNull() ?: peakPredBg)
             val requiredAdditionalInsulinU = if (demandIsf > 0) {
-                max(0.0, (peakPredBg - demandTargetBg) / demandIsf)
+                max(0.0, (demandBg - demandTargetBg) / demandIsf)
             } else 0.0
 
             // E) Determine if low brake should trigger (existing behavior check)
@@ -853,9 +1041,9 @@ class DetermineBasalSippSMB @Inject constructor(
         }
 
         val fractionCarbsLeft: Double = when {
-            meal_data.carbs > 0.0   -> (meal_data.mealCOB / meal_data.carbs).coerceIn(0.0, 1.0)
+            meal_data.carbs > 0.0 -> (meal_data.mealCOB / meal_data.carbs).coerceIn(0.0, 1.0)
             meal_data.mealCOB > 0.0 -> 1.0
-            else                    -> 0.0
+            else                  -> 0.0
         }
         // if we have COB and UAM is enabled, average both
         if (minUAMPredBG < 999 && minCOBPredBG < 999) {
@@ -1101,6 +1289,15 @@ class DetermineBasalSippSMB @Inject constructor(
             var rate = basal + (2 * insulinReq)
             rate = round_basal(rate)
 
+            // F4: Recovery hold also applies to temp basal increases (basal can act like an SMB).
+            // If recovery-hold is active in no-meal context, do not add extra insulin via basal.
+            if (sippRecoveryHoldSmbBlocked && rate > basal) {
+                rT.reason.append("SIPP F4: RecoveryHold caps basal ${round(rate, 2)} -> ${round(basal, 2)}. ")
+                rate = basal
+                insulinReq = 0.0
+            }
+
+
             // if required temp < existing temp basal
             val insulinScheduled = currenttemp.duration * (currenttemp.rate - basal) / 60
             // if current temp would deliver a lot (30% of basal) less than the required insulin,
@@ -1315,9 +1512,10 @@ class DetermineBasalSippSMB @Inject constructor(
             val theoreticalCorrection = max(0.0, (bg - target_bg) / sens)
             val correctionBoundFactor = 1.2
             val correctionLimit = theoreticalCorrection * correctionBoundFactor
+            val iobForCorrectionBound = max(0.0, iob_data.iob)
 
             // Check if we are already over the limit
-            if (theoreticalCorrection > 0 && iob_data.iob > correctionLimit) {
+            if (theoreticalCorrection > 0 && iobForCorrectionBound > correctionLimit) {
                 rT.reason.append("SIPP Safety: IOB ${round(iob_data.iob, 2)} > Limit ${round(correctionLimit, 2)} (${correctionBoundFactor}x). SMB=0, Neutral Basal. ")
                 consoleError.add("SIPP Safety: IOB > Correction Limit. SMB disabled, Basal reset to profile.")
                 // Force neutral basal (profile.current_basal) and zero SMB
@@ -1353,8 +1551,8 @@ class DetermineBasalSippSMB @Inject constructor(
             // SIPP SAFETY: Enforce Correction Bound on new SMB
             // If adding insulinReq (approx SMB size) would push us over, clamp it.
             // Note: Actual SMB size is calculated below as microBolus, but we clamp insulinReq here to influence it.
-            if (theoreticalCorrection > 0 && iob_data.iob + insulinReq > correctionLimit) {
-                val maxAllowed = max(0.0, correctionLimit - iob_data.iob)
+            if (theoreticalCorrection > 0 && iobForCorrectionBound + insulinReq > correctionLimit) {
+                val maxAllowed = max(0.0, correctionLimit - iobForCorrectionBound)
                 if (insulinReq > maxAllowed) {
                     rT.reason.append("SIPP Safety: Clamping req ${round(insulinReq, 2)} -> ${round(maxAllowed, 2)} to fit limit. ")
                     insulinReq = round(maxAllowed, 3)
@@ -1366,7 +1564,9 @@ class DetermineBasalSippSMB @Inject constructor(
             //console.error(iob_data.lastBolusTime);
             //console.error(profile.temptargetSet, target_bg, rT.COB);
             // only allow microboluses with COB or low temp targets, or within DIA hours of a bolus
-            if (microBolusAllowed && enableSMB && bg > threshold && bg >= target_bg) {
+            // NOTE: Do not gate SMB on rT.rate here: rT is the output object and its rate may be null at this point,
+            // which would incorrectly disable SMB entirely.
+            if (microBolusAllowed && enableSMB && bg > threshold && bg >= target_bg && !sippSmbBlocked) {
                 // SIPP SMB caps are absolute insulin units (U), not "basal minutes".
                 val mealInsulinReq = round(meal_data.mealCOB / profile.carb_ratio, 3)
                 val iobU = if (iob_data.iob.isFinite()) iob_data.iob else 0.0
@@ -1388,7 +1588,40 @@ class DetermineBasalSippSMB @Inject constructor(
 
                 // bolus fraction of insulinReq, up to cap and remaining demand, rounding down to nearest bolus increment
                 val roundSMBTo = 1 / profile.bolus_increment
-                val allowedU = max(0.0, min(insulinReq, min(maxBolus, remainingDemandU)))
+
+                // ========================= F2: Two-sided constrained dosing =========================
+                // u_high  : insulin needed to prevent exceeding max_bg at the fast-window peak
+                // u_lowMax: maximum insulin allowed before any predicted point in low-horizon would go below the low floor
+                // clamp(0, u_high, u_lowMax) enforces: never negative, prevent highs as much as possible, never at the cost of predicted lows.
+                //
+                // IMPORTANT: use a robust ISF for constraints (SIPP instant ISF > dynISF > profile sens) and never assume peakScanResult is non-null.
+                val constraintIsf = when {
+                    sippInstantIsfMode && sippInstantIsfMgdlPerU > 0 -> sippInstantIsfMgdlPerU
+                    dynIsfMode && future_sens > 0                    -> future_sens
+                    else                                             -> sens
+                }
+
+                val endIdxHighF2 = min(activePredictions.lastIndex, fastWindowMinutes / 5)
+                val predHighBg = peakScanResult?.peakPredBg
+                    ?: (activePredictions.subList(0, endIdxHighF2 + 1).maxOrNull() ?: bg)
+                val u_high = if (constraintIsf > 0) max(0.0, (predHighBg - max_bg) / constraintIsf) else 0.0
+
+                val lowFloor = max(threshold, min_bg)
+                val endIdxLowF2 = min(activePredictions.lastIndex, sippGuardLowMinutes / 5)
+                val predLowBg = peakScanResult?.minPredBgLow
+                    ?: (activePredictions.subList(0, endIdxLowF2 + 1).minOrNull() ?: bg)
+                val u_lowMax = if (constraintIsf > 0) max(0.0, (predLowBg - lowFloor) / constraintIsf) else 0.0
+
+                // Correction-bound headroom (existing safety concept): don't exceed the correction band once correction IOB is accounted for.
+                val correctionLimit = if (constraintIsf > 0) max(0.0, (max_bg - target_bg) / constraintIsf) else 0.0
+                val iobForCorrectionBound = max(0.0, correctionIOBU)
+                val correctionHeadroom = max(0.0, correctionLimit - iobForCorrectionBound)
+
+                // Constrained request:
+                val constrainedU = min(u_high, u_lowMax)
+                val requestedU = min(constrainedU, min(maxBolus, remainingDemandU + correctionHeadroom))
+
+                val allowedU = max(0.0, requestedU)
                 var microBolus = Math.floor(allowedU * roundSMBTo) / roundSMBTo
 
                 consoleError.add(
@@ -1403,8 +1636,8 @@ class DetermineBasalSippSMB @Inject constructor(
                 val worstCaseInsulinReq = (smbTarget - (naive_eventualBG + minIOBPredBG) / 2.0) / sens
                 var durationReq = round(60 * worstCaseInsulinReq / profile.current_basal)
 
-                // if insulinReq > 0 but not enough for a microBolus, don't set an SMB zero temp
-                if (insulinReq > 0 && microBolus < profile.bolus_increment) {
+                // if allowedU > 0 but not enough for a microBolus, don't set an SMB zero temp
+                if (allowedU > 0 && microBolus < profile.bolus_increment) {
                     durationReq = 0
                 }
 
@@ -1440,8 +1673,6 @@ class DetermineBasalSippSMB @Inject constructor(
                     if (microBolus > 0) {
                         // Final defensive clamp: absolute invariant before assignment
                         microBolus = min(microBolus, maxBolus)
-                        val remainingDemandRoundedDown = Math.floor(remainingDemandU * roundSMBTo) / roundSMBTo
-                        microBolus = min(microBolus, remainingDemandRoundedDown)
                         rT.units = microBolus
                         rT.reason.append("Microbolusing ${microBolus}U. ")
                     }
