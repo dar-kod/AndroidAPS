@@ -29,6 +29,18 @@ object SippPrefs {
         }
     }
 
+    /**
+     * Bind SIPP prefs to the exact SharedPreferences backing the current preference UI / exporter.
+     *
+     * Why: AAPS can use a custom PreferenceDataStore / SharedPreferences instance for settings export/import.
+     * Binding here guarantees SIPP toggles persist and are included in export/import JSON on all devices.
+     */
+    @JvmStatic
+    fun bind(sharedPreferences: SharedPreferences) {
+        sp = sharedPreferences
+    }
+
+
     @JvmStatic
     fun init(prefs: SharedPreferences) {
         if (sp == null) {

@@ -135,7 +135,10 @@ class InsulinOrefSippPlugin @Inject constructor(
             val autoOn = SippPrefs.sleepAutoEnabled()
             val autoSleep = if (autoOn) runCatching {
                 val snap = sipp.activitySnapshot()
-                (!snap.hrActive && !snap.cadenceActive && snap.sustainedActiveMin >= 20)
+                // ActivitySnapshot.sustainedActiveMin is ACTIVE minutes within a 10‑min window (0..10).
+                // Auto-sleep should trigger on sustained INACTIVITY, not >=20.
+                snap.fusionEnabled && (snap.hrEnabled || snap.cadenceEnabled) &&
+                    !snap.hintActive && !snap.hrActive && !snap.cadenceActive && snap.sustainedActiveMin <= 1
             }.getOrDefault(false) else false
 
             val sleepCeilingActive = sleepMasterOn && (inManualSleep || autoSleep)
@@ -300,6 +303,9 @@ class InsulinOrefSippPlugin @Inject constructor(
     ) {
         if (requiredKey != null) return
         SippPrefs.init(context)
+
+
+        preferenceManager.sharedPreferences?.let { SippPrefs.bind(it) }
 
         // ===== SIPP section =====
         val sippCategory = PreferenceCategory(context).also {

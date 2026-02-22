@@ -981,7 +981,10 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
         val isManualSleep = SippPrefs.manualSleepEnabled() && isNowInWindow(SippPrefs.manualSleepStartMin(), SippPrefs.manualSleepEndMin())
         val isAutoSleep = if (SippPrefs.sleepAutoEnabled()) runCatching {
             val snap = sentinelController.activitySnapshot()
-            (!snap.hrActive && !snap.cadenceActive && snap.sustainedActiveMin >= 20)
+            // ActivitySnapshot.sustainedActiveMin is ACTIVE minutes within a 10‑min window (0..10).
+            // Auto-sleep should trigger on sustained INACTIVITY, not >=20.
+            snap.fusionEnabled && (snap.hrEnabled || snap.cadenceEnabled) &&
+                !snap.hintActive && !snap.hrActive && !snap.cadenceActive && snap.sustainedActiveMin <= 1
         }.getOrDefault(false) else false
 
         val isSleepState = isManualSleep || isAutoSleep
@@ -1160,11 +1163,13 @@ open class OpenAPSSippSMBPlugin @Inject constructor(
             .put(BooleanKey.ApsUseDynamicSensitivity, preferences)
             .put(IntKey.ApsDynIsfAdjustmentFactor, preferences)
             .put(sippEnableGuard, preferences)
+            .put("SIPP_CONFIG", SippPrefs.packToJson())
     override fun applyConfiguration(configuration: JSONObject) {
         configuration
             .store(BooleanKey.ApsUseDynamicSensitivity, preferences)
             .store(IntKey.ApsDynIsfAdjustmentFactor, preferences)
             .store(sippEnableGuard, preferences)
+        SippPrefs.applyFromJson(configuration.optJSONObject("SIPP_CONFIG"))
     }
 
     override fun addPreferenceScreen(
